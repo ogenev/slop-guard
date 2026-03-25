@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -14,3 +15,6 @@ sqlx = { version = "0.8", default-features = false, features = ["chrono", "runti
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
