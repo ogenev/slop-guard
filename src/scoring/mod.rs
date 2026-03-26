@@ -3,13 +3,15 @@ use chrono::Utc;
 use crate::domain::{AccountWindow, EvidenceItem, RiskLabel, RiskScore};
 use crate::features::AccountFeatureWindow;
 
+/// Applies the current deterministic heuristic weights to an account feature window.
 #[derive(Clone, Debug, Default)]
 pub struct ScoreEngine;
 
 impl ScoreEngine {
+    /// Produces a score object with label, abstain state, and human-readable evidence.
     pub fn score(
         &self,
-        login: &str,
+        username: &str,
         window_days: u16,
         features: &AccountFeatureWindow,
     ) -> RiskScore {
@@ -20,6 +22,7 @@ impl ScoreEngine {
         let final_risk_score =
             ((ai_usage_score * 0.45) + (slop_score * 0.35) + (predominance_score * 0.20))
                 .clamp(0.0, 1.0);
+        // With no artifacts, we intentionally abstain instead of guessing from empty input.
         let abstained = features.artifact_count == 0;
         let label = if abstained {
             RiskLabel::Abstain
@@ -67,7 +70,7 @@ impl ScoreEngine {
 
         RiskScore {
             account: AccountWindow {
-                login: login.to_owned(),
+                username: username.to_owned(),
                 window_days,
                 generated_at: Utc::now(),
             },

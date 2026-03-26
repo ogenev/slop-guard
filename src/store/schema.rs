@@ -1,10 +1,15 @@
 use sqlx::SqlitePool;
 
+/// Bootstrap schema for the current prototype database.
+///
+/// This is intentionally simple today and can later be replaced by versioned
+/// SQL migrations once we need to preserve existing databases across schema
+/// changes.
 const STATEMENTS: [&str; 10] = [
     r#"
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY,
-        login TEXT NOT NULL UNIQUE,
+        username TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
@@ -69,7 +74,7 @@ const STATEMENTS: [&str; 10] = [
     )
     "#,
     r#"
-    CREATE INDEX IF NOT EXISTS idx_accounts_login ON accounts(login)
+    CREATE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username)
     "#,
     r#"
     CREATE INDEX IF NOT EXISTS idx_repositories_full_name ON repositories(full_name)
@@ -85,6 +90,7 @@ const STATEMENTS: [&str; 10] = [
     "#,
 ];
 
+/// Applies all bootstrap DDL statements to the target SQLite database.
 pub async fn apply(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     for statement in STATEMENTS {
         sqlx::query(statement).execute(pool).await?;

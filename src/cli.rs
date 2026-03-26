@@ -10,6 +10,7 @@ use crate::ingest::IngestService;
 use crate::scoring::ScoreEngine;
 use crate::store::Store;
 
+/// Top-level CLI definition for the current vertical slice.
 #[derive(Debug, Parser)]
 #[command(name = "aislop", about = "AI slop account classifier scaffold")]
 pub struct Cli {
@@ -29,29 +30,33 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     SyncAccount {
-        login: String,
+        username: String,
         #[arg(long, default_value_t = 90)]
         days: u16,
     },
     ScoreAccount {
-        login: String,
+        username: String,
         #[arg(long, default_value_t = 90)]
         window_days: u16,
     },
     ShowLayout,
 }
 
+/// Parses CLI arguments and dispatches to the selected command.
 pub async fn run() -> Result<()> {
     let Cli { db_path, command } = Cli::parse();
 
     match command {
-        Command::SyncAccount { login, days } => {
+        Command::SyncAccount { username, days } => {
             let database_path = resolve_database_path(db_path.clone())?;
-            sync_account(&database_path, login, days).await?
+            sync_account(&database_path, username, days).await?
         }
-        Command::ScoreAccount { login, window_days } => {
+        Command::ScoreAccount {
+            username,
+            window_days,
+        } => {
             let database_path = resolve_database_path(db_path)?;
-            score_account(&database_path, login, window_days)?
+            score_account(&database_path, username, window_days)?
         }
         Command::ShowLayout => show_layout()?,
     }
@@ -59,6 +64,7 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Resolves the SQLite database path from CLI input or the OS app-data directory.
 fn resolve_database_path(configured_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = configured_path {
         return Ok(path);
@@ -71,16 +77,19 @@ fn resolve_database_path(configured_path: Option<PathBuf>) -> Result<PathBuf> {
     Ok(app_data_dir.join("aislop").join("aislop.db"))
 }
 
-async fn sync_account(database_path: &Path, login: String, days: u16) -> Result<()> {
+/// Runs the real GitHub ingestion flow and prints the sync summary as JSON.
+async fn sync_account(database_path: &Path, username: String, days: u16) -> Result<()> {
     let store = Store::connect(database_path).await?;
-    let service = IngestService::new(GitHubClient::default(), store);
-    let summary = service.sync_account(&login, days).await?;
+    let client = GitHubClient::from_env()?;
+    let service = IngestService::new(client, store);
+    let summary = service.sync_account(&username, days).await?;
 
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
 
-fn score_account(_database_path: &Path, login: String, window_days: u16) -> Result<()> {
+/// Scores an account window using the currently wired analyzer/aggregation scaffold.
+fn score_account(_database_path: &Path, username: String, window_days: u16) -> Result<()> {
     let analyzer = ExplicitMarkerAnalyzer;
     let artifacts = vec![
         analyzer.analyze("Generated with Claude Code"),
@@ -88,12 +97,13 @@ fn score_account(_database_path: &Path, login: String, window_days: u16) -> Resu
     ];
     let window = aggregate(&artifacts);
     let engine = ScoreEngine;
-    let score = engine.score(&login, window_days, &window);
+    let score = engine.score(&username, window_days, &window);
 
     println!("{}", serde_json::to_string_pretty(&score)?);
     Ok(())
 }
 
+/// Prints the current package/module layout for quick inspection.
 fn show_layout() -> Result<()> {
     let layout = serde_json::json!({
         "package": "slop-guard",

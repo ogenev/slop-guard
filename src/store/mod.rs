@@ -9,17 +9,20 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
+/// Thin SQLite-backed persistence layer for accounts, artifacts, commits, and sync runs.
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
 }
 
+/// Minimal account row returned by lookup helpers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRecord {
     pub id: i64,
-    pub login: String,
+    pub username: String,
 }
 
+/// Input payload for inserting or updating one normalized artifact row.
 #[derive(Clone, Debug)]
 pub struct ArtifactUpsert<'a> {
     pub account_id: i64,
@@ -39,6 +42,7 @@ pub struct ArtifactUpsert<'a> {
     pub head_branch: Option<&'a str>,
 }
 
+/// Input payload for inserting or updating one commit row.
 #[derive(Clone, Debug)]
 pub struct CommitUpsert<'a> {
     pub artifact_id: i64,
@@ -48,6 +52,7 @@ pub struct CommitUpsert<'a> {
     pub committed_at: Option<&'a str>,
 }
 
+/// Lifecycle state persisted for a sync run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncRunStatus {
     Running,
@@ -66,6 +71,7 @@ impl SyncRunStatus {
 }
 
 impl Store {
+    /// Opens the SQLite database, creating parent directories and bootstrapping the schema.
     pub async fn connect(database_path: &Path) -> Result<Self> {
         if let Some(parent) = database_path
             .parent()
@@ -101,53 +107,58 @@ impl Store {
         Ok(store)
     }
 
+    /// Exposes the underlying pool for integration tests and focused queries.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
+    /// Applies the current bootstrap schema to a newly opened database.
     async fn init_schema(&self) -> Result<()> {
         schema::apply(&self.pool)
             .await
             .context("failed to initialize sqlite schema")
     }
 
-    pub async fn upsert_account(&self, login: &str) -> Result<i64> {
+    /// Inserts or refreshes an account row and returns its stable identifier.
+    pub async fn upsert_account(&self, username: &str) -> Result<i64> {
         let id = sqlx::query_scalar::<_, i64>(
             r#"
-            INSERT INTO accounts (login)
+            INSERT INTO accounts (username)
             VALUES (?)
-            ON CONFLICT(login) DO UPDATE SET
+            ON CONFLICT(username) DO UPDATE SET
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             RETURNING id
             "#,
         )
-        .bind(login)
+        .bind(username)
         .fetch_one(&self.pool)
         .await
-        .with_context(|| format!("failed to upsert account with login {login}"))?;
+        .with_context(|| format!("failed to upsert account with username {username}"))?;
 
         Ok(id)
     }
 
-    pub async fn find_account_by_login(&self, login: &str) -> Result<Option<AccountRecord>> {
+    /// Looks up an account by username if it has already been seen locally.
+    pub async fn find_account_by_username(&self, username: &str) -> Result<Option<AccountRecord>> {
         let row = sqlx::query(
             r#"
-            SELECT id, login
+            SELECT id, username
             FROM accounts
-            WHERE login = ?
+            WHERE username = ?
             "#,
         )
-        .bind(login)
+        .bind(username)
         .fetch_optional(&self.pool)
         .await
-        .with_context(|| format!("failed to lookup account with login {login}"))?;
+        .with_context(|| format!("failed to lookup account with username {username}"))?;
 
         Ok(row.map(|row| AccountRecord {
             id: row.get("id"),
-            login: row.get("login"),
+            username: row.get("username"),
         }))
     }
 
+    /// Inserts or refreshes a repository row and returns its stable identifier.
     pub async fn upsert_repository(&self, owner: &str, name: &str) -> Result<i64> {
         let full_name = format!("{owner}/{name}");
 
@@ -172,6 +183,7 @@ impl Store {
         Ok(id)
     }
 
+    /// Inserts or refreshes a normalized artifact and returns its row identifier.
     pub async fn upsert_artifact(&self, input: &ArtifactUpsert<'_>) -> Result<i64> {
         let id = sqlx::query_scalar::<_, i64>(
             r#"
@@ -237,6 +249,7 @@ impl Store {
         Ok(id)
     }
 
+    /// Inserts or refreshes a commit row for an artifact and returns its row identifier.
     pub async fn upsert_commit(&self, input: &CommitUpsert<'_>) -> Result<i64> {
         let id = sqlx::query_scalar::<_, i64>(
             r#"
@@ -267,6 +280,23 @@ impl Store {
         Ok(id)
     }
 
+    /// Deletes all commits currently associated with an artifact.
+    pub async fn delete_commits_for_artifact(&self, artifact_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM commits
+            WHERE artifact_id = ?
+            "#,
+        )
+        .bind(artifact_id)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("failed to delete commits for artifact {artifact_id}"))?;
+
+        Ok(())
+    }
+
+    /// Creates a new sync-run record before remote ingestion starts.
     pub async fn start_sync_run(&self, account_id: i64, window_days: u16) -> Result<i64> {
         let started_at = Utc::now().to_rfc3339();
 
@@ -298,6 +328,7 @@ impl Store {
         Ok(run_id)
     }
 
+    /// Marks a sync run as finished and records aggregate outcome counters.
     pub async fn finish_sync_run(
         &self,
         run_id: i64,
@@ -337,7 +368,7 @@ impl Store {
 mod tests {
     use tempfile::TempDir;
 
-    use super::{Store, SyncRunStatus};
+    use super::{ArtifactUpsert, CommitUpsert, Store, SyncRunStatus};
 
     #[tokio::test]
     async fn schema_init_is_idempotent() {
@@ -386,13 +417,103 @@ mod tests {
         assert_eq!(first_id, second_id);
 
         let account = store
-            .find_account_by_login("ogi")
+            .find_account_by_username("ogi")
             .await
             .expect("account lookup should work")
             .expect("account should exist");
 
         assert_eq!(account.id, first_id);
-        assert_eq!(account.login, "ogi");
+        assert_eq!(account.username, "ogi");
+    }
+
+    #[tokio::test]
+    async fn artifact_commit_sets_can_be_replaced() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("aislop.db");
+        let store = Store::connect(&db_path)
+            .await
+            .expect("store should connect for test");
+
+        let account_id = store
+            .upsert_account("ogi")
+            .await
+            .expect("account upsert should work");
+        let repository_id = store
+            .upsert_repository("rust-lang", "cargo")
+            .await
+            .expect("repository upsert should work");
+        let artifact_id = store
+            .upsert_artifact(&ArtifactUpsert {
+                account_id,
+                repository_id: Some(repository_id),
+                kind: "pull_request",
+                external_id: "9001",
+                pr_number: Some(42),
+                title: Some("Improve parser coverage"),
+                body: Some("Adds regression tests and cleanup."),
+                state: Some("open"),
+                created_at: "2026-03-01T10:00:00Z",
+                updated_at: "2026-03-01T11:00:00Z",
+                additions: 17,
+                deletions: 4,
+                changed_files: 3,
+                base_branch: Some("main"),
+                head_branch: Some("topic/coverage"),
+            })
+            .await
+            .expect("artifact upsert should work");
+
+        store
+            .upsert_commit(&CommitUpsert {
+                artifact_id,
+                sha: "abc123",
+                message: "test: add parser regression",
+                authored_at: Some("2026-03-01T09:00:00Z"),
+                committed_at: Some("2026-03-01T09:05:00Z"),
+            })
+            .await
+            .expect("first commit upsert should work");
+        store
+            .upsert_commit(&CommitUpsert {
+                artifact_id,
+                sha: "def456",
+                message: "refactor: simplify fixtures",
+                authored_at: Some("2026-03-01T09:10:00Z"),
+                committed_at: Some("2026-03-01T09:15:00Z"),
+            })
+            .await
+            .expect("second commit upsert should work");
+
+        store
+            .delete_commits_for_artifact(artifact_id)
+            .await
+            .expect("commit set deletion should work");
+        store
+            .upsert_commit(&CommitUpsert {
+                artifact_id,
+                sha: "fedcba",
+                message: "fix: keep only latest commit set",
+                authored_at: Some("2026-03-01T09:20:00Z"),
+                committed_at: Some("2026-03-01T09:25:00Z"),
+            })
+            .await
+            .expect("replacement commit upsert should work");
+
+        let commit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM commits WHERE artifact_id = ?")
+                .bind(artifact_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("commit count should be queryable");
+        let remaining_sha: String =
+            sqlx::query_scalar("SELECT sha FROM commits WHERE artifact_id = ?")
+                .bind(artifact_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("remaining commit should be queryable");
+
+        assert_eq!(commit_count, 1);
+        assert_eq!(remaining_sha, "fedcba");
     }
 
     #[tokio::test]
