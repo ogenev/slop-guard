@@ -43,13 +43,15 @@ pub(crate) struct GraphQlError {
 
 /// Account lookup result used to distinguish users from organizations.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct AccountLookupData {
-    pub user: Option<GraphQlUsernameNode>,
-    pub organization: Option<GraphQlUsernameNode>,
+    pub repository_owner: Option<GraphQlAccountOwnerNode>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct GraphQlUsernameNode {
+pub(crate) struct GraphQlAccountOwnerNode {
+    #[serde(rename = "__typename")]
+    pub typename: String,
     pub username: String,
 }
 

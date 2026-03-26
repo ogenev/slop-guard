@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, fmt};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration, Utc};
@@ -23,10 +23,8 @@ const GITHUB_GRAPHQL_ACCEPT_HEADER: &str = "application/json";
 // of the codebase can consistently use our preferred terminology.
 const ACCOUNT_LOOKUP_QUERY: &str = r#"
 query AccountLookup($username: String!) {
-  user(login: $username) {
-    username: login
-  }
-  organization(login: $username) {
+  repositoryOwner(login: $username) {
+    __typename
     username: login
   }
 }
@@ -114,12 +112,24 @@ query PullRequestCommitsPage($pullRequestId: ID!, $cursor: String) {
 "#;
 
 /// Small GitHub GraphQL client focused on public-account pull-request ingestion.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitHubClient {
     inner: Client,
     user_agent: String,
     graphql_url: Url,
     token: String,
+}
+
+impl fmt::Debug for GitHubClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitHubClient")
+            .field("inner", &self.inner)
+            .field("user_agent", &self.user_agent)
+            .field("graphql_url", &self.graphql_url)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl GitHubClient {
@@ -193,16 +203,20 @@ impl GitHubClient {
             )
             .await?;
 
-        if let Some(user) = response.user {
-            let _ = user.username;
-            return Ok(());
+        match response.repository_owner {
+            Some(owner) if owner.typename == "User" => {
+                let _ = owner.username;
+                Ok(())
+            }
+            Some(owner) if owner.typename == "Organization" => {
+                bail!("GitHub username {username} is not a user account")
+            }
+            Some(owner) => bail!(
+                "GitHub username {username} resolved to unsupported account type {}",
+                owner.typename
+            ),
+            None => bail!("GitHub user {username} does not exist"),
         }
-
-        if response.organization.is_some() {
-            bail!("GitHub username {username} is not a user account")
-        }
-
-        bail!("GitHub user {username} does not exist")
     }
 
     /// Fetches recent public pull requests authored by the given username.
@@ -549,6 +563,67 @@ mod tests {
     };
 
     use super::GitHubClient;
+
+    #[test]
+    fn debug_output_redacts_the_github_token() {
+        let client = GitHubClient::new("test-agent", "super-secret-token")
+            .expect("test GitHub client should be created");
+
+        let debug_output = format!("{client:?}");
+
+        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains("super-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn ensure_public_user_accepts_users() {
+        let server = MockServer::start().await;
+        let client = test_client(&server);
+
+        mock_graphql_response(
+            &server,
+            "AccountLookup",
+            Some("\"username\":\"octocat\""),
+            json!({
+                "repositoryOwner": {
+                    "__typename": "User",
+                    "username": "octocat"
+                }
+            }),
+        )
+        .await;
+
+        client
+            .ensure_public_user("octocat")
+            .await
+            .expect("user lookup should succeed");
+    }
+
+    #[tokio::test]
+    async fn ensure_public_user_rejects_organizations() {
+        let server = MockServer::start().await;
+        let client = test_client(&server);
+
+        mock_graphql_response(
+            &server,
+            "AccountLookup",
+            Some("\"username\":\"rust-lang\""),
+            json!({
+                "repositoryOwner": {
+                    "__typename": "Organization",
+                    "username": "rust-lang"
+                }
+            }),
+        )
+        .await;
+
+        let error = client
+            .ensure_public_user("rust-lang")
+            .await
+            .expect_err("organization lookup should fail");
+
+        assert!(error.to_string().contains("not a user account"));
+    }
 
     #[tokio::test]
     async fn fetches_authored_pull_requests_with_commit_hydration() {

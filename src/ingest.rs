@@ -380,8 +380,7 @@ mod tests {
             "AccountLookup",
             Some("\"username\":\"missing-user\""),
             json!({
-                "user": null,
-                "organization": null
+                "repositoryOwner": null
             }),
         )
         .await;
@@ -432,8 +431,10 @@ mod tests {
             "AccountLookup",
             Some(&format!("\"username\":\"{username}\"")),
             json!({
-                "user": { "username": username },
-                "organization": null
+                "repositoryOwner": {
+                    "__typename": "User",
+                    "username": username
+                }
             }),
         )
         .await;
