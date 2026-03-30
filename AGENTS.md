@@ -4,6 +4,7 @@
 - Current layout: `src/cli.rs`, `src/github/`, `src/store/`, `src/analyzers/`, `src/features/`, `src/scoring/`.
 - Add new top-level modules only when the boundary is real; do not split into a workspace prematurely.
 - Add comments to any important structs and methods
+- Do not keep backward compatibility unless the user explicitly asks for it
 - For Rust validation, run:
   - `cargo test`
   - `cargo +nightly fmt --all`

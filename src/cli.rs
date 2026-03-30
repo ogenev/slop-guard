@@ -2,22 +2,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
 use crate::analyzers::analyze_pull_requests;
+use crate::domain::RiskScore;
 use crate::features::aggregate;
 use crate::github::GitHubClient;
-use crate::ingest::IngestService;
+use crate::ingest::{IngestService, SyncSummary};
 use crate::scoring::ScoreEngine;
 use crate::store::Store;
 
 /// Top-level CLI definition for the current vertical slice.
 #[derive(Debug, Parser)]
-#[command(name = "aislop", about = "AI slop account classifier scaffold")]
+#[command(name = "slop", about = "AI slop account classifier scaffold")]
 pub struct Cli {
     #[arg(
         long,
         global = true,
-        env = "AISLOP_DB_PATH",
+        env = "SLOP_DB_PATH",
         value_name = "PATH",
         help = "Path to SQLite database file"
     )]
@@ -29,17 +31,29 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    SyncAccount {
+    Sync {
         username: String,
-        #[arg(long, default_value_t = 90)]
+        #[arg(long, default_value_t = 30)]
         days: u16,
     },
-    ScoreAccount {
+    Score {
         username: String,
-        #[arg(long, default_value_t = 90)]
-        window_days: u16,
+        #[arg(long = "days", default_value_t = 30)]
+        days: u16,
+    },
+    Analyze {
+        username: String,
+        #[arg(long, default_value_t = 30)]
+        days: u16,
     },
     ShowLayout,
+}
+
+/// Combined output emitted by the unified analyze command.
+#[derive(Debug, Serialize)]
+struct AnalyzeAccountOutput {
+    sync: SyncSummary,
+    score: RiskScore,
 }
 
 /// Parses CLI arguments and dispatches to the selected command.
@@ -47,16 +61,22 @@ pub async fn run() -> Result<()> {
     let Cli { db_path, command } = Cli::parse();
 
     match command {
-        Command::SyncAccount { username, days } => {
+        Command::Sync { username, days } => {
             let database_path = resolve_database_path(db_path.clone())?;
-            sync_account(&database_path, username, days).await?
+            let summary = sync_account(&database_path, &username, days).await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
-        Command::ScoreAccount {
-            username,
-            window_days,
-        } => {
+        Command::Score { username, days } => {
+            let database_path = resolve_database_path(db_path.clone())?;
+            let score = score_account(&database_path, &username, days).await?;
+            println!("{}", serde_json::to_string_pretty(&score)?);
+        }
+        Command::Analyze { username, days } => {
             let database_path = resolve_database_path(db_path)?;
-            score_account(&database_path, username, window_days).await?
+            let sync = sync_account(&database_path, &username, days).await?;
+            let score = score_account(&database_path, &username, days).await?;
+            let output = AnalyzeAccountOutput { sync, score };
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
         Command::ShowLayout => show_layout()?,
     }
@@ -72,35 +92,30 @@ fn resolve_database_path(configured_path: Option<PathBuf>) -> Result<PathBuf> {
 
     let app_data_dir = dirs::data_local_dir()
         .or_else(dirs::data_dir)
-        .context("unable to determine app-data directory; pass --db-path or set AISLOP_DB_PATH")?;
+        .context("unable to determine app-data directory; pass --db-path or set SLOP_DB_PATH")?;
 
-    Ok(app_data_dir.join("aislop").join("aislop.db"))
+    Ok(app_data_dir.join("slop").join("slop.db"))
 }
 
-/// Runs the real GitHub ingestion flow and prints the sync summary as JSON.
-async fn sync_account(database_path: &Path, username: String, days: u16) -> Result<()> {
+/// Runs the real GitHub ingestion flow and returns the sync summary.
+async fn sync_account(database_path: &Path, username: &str, days: u16) -> Result<SyncSummary> {
     let store = Store::connect(database_path).await?;
     let client = GitHubClient::from_env()?;
     let service = IngestService::new(client, store);
-    let summary = service.sync_account(&username, days).await?;
-
-    println!("{}", serde_json::to_string_pretty(&summary)?);
-    Ok(())
+    service.sync_account(username, days).await
 }
 
 /// Scores an account window from stored SQLite artifacts using the analyze-on-read flow.
-async fn score_account(database_path: &Path, username: String, window_days: u16) -> Result<()> {
+async fn score_account(database_path: &Path, username: &str, days: u16) -> Result<RiskScore> {
     let store = Store::connect(database_path).await?;
     let artifacts = store
-        .load_pull_requests_for_account_window(&username, window_days)
+        .load_pull_requests_for_account_window(username, days)
         .await?;
     let analyzed_artifacts = analyze_pull_requests(&artifacts);
     let window = aggregate(&analyzed_artifacts);
     let engine = ScoreEngine;
-    let score = engine.score(&username, window_days, &window);
 
-    println!("{}", serde_json::to_string_pretty(&score)?);
-    Ok(())
+    Ok(engine.score(username, days, &window))
 }
 
 /// Prints the current package/module layout for quick inspection.
@@ -129,14 +144,49 @@ fn show_layout() -> Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::resolve_database_path;
+    use clap::Parser;
+
+    use super::{Cli, Command, resolve_database_path};
 
     #[test]
     fn prefers_explicit_database_path() {
-        let provided = PathBuf::from("/tmp/aislop-custom.db");
+        let provided = PathBuf::from("/tmp/slop-custom.db");
         let resolved = resolve_database_path(Some(provided.clone()))
             .expect("resolving explicit database path should succeed");
 
         assert_eq!(resolved, provided);
+    }
+
+    #[test]
+    fn parses_renamed_commands() {
+        let cli = Cli::try_parse_from(["slop", "sync", "ogi", "--days", "30"])
+            .expect("sync command should parse");
+        match cli.command {
+            Command::Sync { username, days } => {
+                assert_eq!(username, "ogi");
+                assert_eq!(days, 30);
+            }
+            other => panic!("expected sync command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["slop", "score", "ogi", "--days", "45"])
+            .expect("score command should parse");
+        match cli.command {
+            Command::Score { username, days } => {
+                assert_eq!(username, "ogi");
+                assert_eq!(days, 45);
+            }
+            other => panic!("expected score command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["slop", "analyze", "ogi", "--days", "60"])
+            .expect("analyze command should parse");
+        match cli.command {
+            Command::Analyze { username, days } => {
+                assert_eq!(username, "ogi");
+                assert_eq!(days, 60);
+            }
+            other => panic!("expected analyze command, got {other:?}"),
+        }
     }
 }
