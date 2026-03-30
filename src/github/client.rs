@@ -1,4 +1,7 @@
-use std::{env, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fmt,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration, Utc};
@@ -12,7 +15,8 @@ use serde_json::{Value, json};
 use super::models::{
     AccountLookupData, GraphQlCommitConnection, GraphQlError, GraphQlPullRequestCommitNode,
     GraphQlRepository, GraphQlResponse, NormalizedCommit, NormalizedPullRequest,
-    PullRequestCommitsPageData, SearchPullRequestsData, SearchResultNode,
+    PullRequestCommitsPageData, PullRequestDetailsData, PullRequestDetailsNode,
+    SearchPullRequestRefNode, SearchPullRequestsData,
 };
 
 const DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -32,7 +36,7 @@ query AccountLookup($username: String!) {
 
 const SEARCH_AUTHORED_PULL_REQUESTS_QUERY: &str = r#"
 query SearchAuthoredPullRequests($query: String!, $cursor: String) {
-  search(query: $query, type: ISSUE, first: 100, after: $cursor) {
+  search(query: $query, type: ISSUE, first: 25, after: $cursor) {
     pageInfo {
       hasNextPage
       endCursor
@@ -41,18 +45,8 @@ query SearchAuthoredPullRequests($query: String!, $cursor: String) {
       __typename
       ... on PullRequest {
         id
-        databaseId
         number
-        title
-        body
-        state
         createdAt
-        updatedAt
-        additions
-        deletions
-        changedFiles
-        baseRefName
-        headRefName
         repository {
           name
           isPrivate
@@ -60,18 +54,48 @@ query SearchAuthoredPullRequests($query: String!, $cursor: String) {
             username: login
           }
         }
-        commits(first: 100) {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          nodes {
-            commit {
-              oid
-              message
-              authoredDate
-              committedDate
-            }
+      }
+    }
+  }
+}
+"#;
+
+const PULL_REQUEST_DETAILS_QUERY: &str = r#"
+query PullRequestDetailsBatch($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    ... on PullRequest {
+      id
+      databaseId
+      number
+      title
+      body
+      state
+      createdAt
+      updatedAt
+      additions
+      deletions
+      changedFiles
+      baseRefName
+      headRefName
+      repository {
+        name
+        isPrivate
+        owner {
+          username: login
+        }
+      }
+      commits(first: 100) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          commit {
+            oid
+            message
+            authoredDate
+            committedDate
           }
         }
       }
@@ -110,6 +134,17 @@ query PullRequestCommitsPage($pullRequestId: ID!, $cursor: String) {
   }
 }
 "#;
+
+const PULL_REQUEST_DETAILS_BATCH_SIZE: usize = 10;
+
+/// Lightweight discovery record collected from the authored-PR search query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveredPullRequestRef {
+    node_id: String,
+    repository_owner: String,
+    repository_name: String,
+    number: i64,
+}
 
 /// Small GitHub GraphQL client focused on public-account pull-request ingestion.
 #[derive(Clone)]
@@ -230,15 +265,37 @@ impl GitHubClient {
             .format("%Y-%m-%d")
             .to_string();
         let search_query = format!("is:pr author:{username} created:>={cutoff}");
+        let pull_request_refs = self
+            .search_authored_pull_request_refs(username, &search_query)
+            .await?;
+        let mut pull_requests = Vec::with_capacity(pull_request_refs.len());
+
+        for pull_request_batch in pull_request_refs.chunks(PULL_REQUEST_DETAILS_BATCH_SIZE) {
+            pull_requests.extend(
+                self.fetch_pull_request_details_batch(pull_request_batch)
+                    .await?,
+            );
+        }
+
+        Ok(pull_requests)
+    }
+
+    /// Runs the lightweight authored-PR search query and collects discovered PR ids.
+    async fn search_authored_pull_request_refs(
+        &self,
+        username: &str,
+        search_query: &str,
+    ) -> Result<Vec<DiscoveredPullRequestRef>> {
         let mut cursor = None;
-        let mut pull_requests = Vec::new();
+        let mut pull_request_refs = Vec::new();
+        let mut seen_node_ids = HashSet::new();
 
         loop {
             let response = self
                 .post_graphql::<SearchPullRequestsData>(
                     SEARCH_AUTHORED_PULL_REQUESTS_QUERY,
                     json!({
-                        "query": search_query.as_str(),
+                        "query": search_query,
                         "cursor": cursor,
                     }),
                     &format!("failed to search authored pull requests for GitHub user {username}"),
@@ -247,8 +304,10 @@ impl GitHubClient {
             let page_info = response.search.page_info;
 
             for node in response.search.nodes.into_iter().flatten() {
-                if let Some(pull_request) = self.normalize_search_result_node(node).await? {
-                    pull_requests.push(pull_request);
+                if let Some(pull_request_ref) = Self::normalize_search_ref_node(node)?
+                    && seen_node_ids.insert(pull_request_ref.node_id.clone())
+                {
+                    pull_request_refs.push(pull_request_ref);
                 }
             }
 
@@ -261,19 +320,106 @@ impl GitHubClient {
             ))?);
         }
 
-        Ok(pull_requests)
+        Ok(pull_request_refs)
     }
 
-    /// Converts one GraphQL search node into our normalized PR shape.
-    async fn normalize_search_result_node(
-        &self,
-        node: SearchResultNode,
-    ) -> Result<Option<NormalizedPullRequest>> {
+    /// Converts one lightweight search node into an internal discovered-PR reference.
+    fn normalize_search_ref_node(
+        node: SearchPullRequestRefNode,
+    ) -> Result<Option<DiscoveredPullRequestRef>> {
         if node.typename != "PullRequest" {
             return Ok(None);
         }
 
         let node_id = required(node.id, "pull request search result is missing node id")?;
+        let repository = required(
+            node.repository,
+            format!("pull request node {node_id} is missing repository metadata"),
+        )?;
+
+        if repository.is_private {
+            return Ok(None);
+        }
+
+        let number = required(
+            node.number,
+            format!("pull request node {node_id} is missing number"),
+        )?;
+        let _created_at = required(
+            node.created_at,
+            format!("pull request node {node_id} is missing createdAt"),
+        )?;
+
+        Ok(Some(DiscoveredPullRequestRef {
+            node_id,
+            repository_owner: repository.owner.username,
+            repository_name: repository.name,
+            number,
+        }))
+    }
+
+    /// Hydrates one batch of discovered pull requests with full detail payloads.
+    async fn fetch_pull_request_details_batch(
+        &self,
+        pull_request_refs: &[DiscoveredPullRequestRef],
+    ) -> Result<Vec<NormalizedPullRequest>> {
+        let response = self
+            .post_graphql::<PullRequestDetailsData>(
+                PULL_REQUEST_DETAILS_QUERY,
+                json!({
+                    "ids": pull_request_refs
+                        .iter()
+                        .map(|pull_request_ref| pull_request_ref.node_id.as_str())
+                        .collect::<Vec<_>>(),
+                }),
+                &format!(
+                    "failed to fetch details for {} discovered pull requests",
+                    pull_request_refs.len()
+                ),
+            )
+            .await?;
+        let mut nodes_by_id = HashMap::with_capacity(response.nodes.len());
+
+        for node in response.nodes.into_iter().flatten() {
+            let node_id = required(
+                node.id.clone(),
+                "pull request details batch included a node without id",
+            )?;
+            nodes_by_id.insert(node_id, node);
+        }
+
+        let mut pull_requests = Vec::with_capacity(pull_request_refs.len());
+
+        for pull_request_ref in pull_request_refs {
+            let node = nodes_by_id.remove(&pull_request_ref.node_id).context(format!(
+                "GitHub GraphQL details response did not include pull request {} / {}#{} (node {})",
+                pull_request_ref.repository_owner,
+                pull_request_ref.repository_name,
+                pull_request_ref.number,
+                pull_request_ref.node_id,
+            ))?;
+
+            if let Some(pull_request) = self.normalize_pull_request_details_node(node).await? {
+                pull_requests.push(pull_request);
+            }
+        }
+
+        Ok(pull_requests)
+    }
+
+    /// Converts one fully hydrated pull-request node into our normalized PR shape.
+    async fn normalize_pull_request_details_node(
+        &self,
+        node: PullRequestDetailsNode,
+    ) -> Result<Option<NormalizedPullRequest>> {
+        if node.typename != "PullRequest" {
+            bail!(
+                "GitHub GraphQL details batch returned non-pull-request node type {}",
+                node.typename
+            )
+        }
+
+        let node_id = required(node.id, "pull request details node is missing node id")?;
         let repository = required(
             node.repository,
             format!("pull request node {node_id} is missing repository metadata"),
@@ -330,8 +476,8 @@ impl GitHubClient {
             node.commits,
             format!("pull request node {node_id} is missing commit connection"),
         )?;
-        // The search query eagerly fetches the first commit page so most PRs can be
-        // normalized without additional round trips.
+        // The details batch eagerly fetches the first commit page so most PRs can be
+        // normalized without additional commit-only round trips.
         let mut commits = normalize_commit_nodes(commit_connection.nodes);
         let mut page_info = commit_connection.page_info;
 
@@ -554,346 +700,4 @@ fn is_rate_limit_error(headers: &HeaderMap, message: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use reqwest::Url;
-    use serde_json::{Value, json};
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{body_string_contains, method, path},
-    };
-
-    use super::GitHubClient;
-
-    #[test]
-    fn debug_output_redacts_the_github_token() {
-        let client = GitHubClient::new("test-agent", "super-secret-token")
-            .expect("test GitHub client should be created");
-
-        let debug_output = format!("{client:?}");
-
-        assert!(debug_output.contains("<redacted>"));
-        assert!(!debug_output.contains("super-secret-token"));
-    }
-
-    #[tokio::test]
-    async fn ensure_public_user_accepts_users() {
-        let server = MockServer::start().await;
-        let client = test_client(&server);
-
-        mock_graphql_response(
-            &server,
-            "AccountLookup",
-            Some("\"username\":\"octocat\""),
-            json!({
-                "repositoryOwner": {
-                    "__typename": "User",
-                    "username": "octocat"
-                }
-            }),
-        )
-        .await;
-
-        client
-            .ensure_public_user("octocat")
-            .await
-            .expect("user lookup should succeed");
-    }
-
-    #[tokio::test]
-    async fn ensure_public_user_rejects_organizations() {
-        let server = MockServer::start().await;
-        let client = test_client(&server);
-
-        mock_graphql_response(
-            &server,
-            "AccountLookup",
-            Some("\"username\":\"rust-lang\""),
-            json!({
-                "repositoryOwner": {
-                    "__typename": "Organization",
-                    "username": "rust-lang"
-                }
-            }),
-        )
-        .await;
-
-        let error = client
-            .ensure_public_user("rust-lang")
-            .await
-            .expect_err("organization lookup should fail");
-
-        assert!(error.to_string().contains("not a user account"));
-    }
-
-    #[tokio::test]
-    async fn fetches_authored_pull_requests_with_commit_hydration() {
-        let server = MockServer::start().await;
-        let client = test_client(&server);
-
-        mock_graphql_response(
-            &server,
-            "SearchAuthoredPullRequests",
-            Some("\"cursor\":null"),
-            json!({
-                "search": {
-                    "pageInfo": {
-                        "hasNextPage": false,
-                        "endCursor": null
-                    },
-                    "nodes": [
-                        {
-                            "__typename": "PullRequest",
-                            "id": "PR_kwDOAAABc842",
-                            "databaseId": 12345,
-                            "number": 42,
-                            "title": "Improve parser coverage",
-                            "body": "Adds regression tests and cleanup.",
-                            "state": "OPEN",
-                            "createdAt": "2026-03-01T10:00:00Z",
-                            "updatedAt": "2026-03-01T11:00:00Z",
-                            "additions": 17,
-                            "deletions": 4,
-                            "changedFiles": 3,
-                            "baseRefName": "main",
-                            "headRefName": "topic/coverage",
-                            "repository": {
-                                "name": "cargo",
-                                "isPrivate": false,
-                                "owner": { "username": "rust-lang" }
-                            },
-                            "commits": {
-                                "pageInfo": {
-                                    "hasNextPage": false,
-                                    "endCursor": null
-                                },
-                                "nodes": [
-                                    {
-                                        "commit": {
-                                            "oid": "abc123",
-                                            "message": "test: add parser regression",
-                                            "authoredDate": "2026-03-01T09:00:00Z",
-                                            "committedDate": "2026-03-01T09:05:00Z"
-                                        }
-                                    },
-                                    {
-                                        "commit": {
-                                            "oid": "def456",
-                                            "message": "refactor: simplify fixtures",
-                                            "authoredDate": "2026-03-01T09:10:00Z",
-                                            "committedDate": "2026-03-01T09:15:00Z"
-                                        }
-                                    }
-                                ]
-                            }
-                        }
-                    ]
-                }
-            }),
-        )
-        .await;
-
-        let pull_requests = client
-            .fetch_authored_pull_requests("octocat", 30)
-            .await
-            .expect("pull requests should be fetched");
-
-        assert_eq!(pull_requests.len(), 1);
-        let pull_request = &pull_requests[0];
-        assert_eq!(pull_request.external_id, "12345");
-        assert_eq!(pull_request.repository_owner, "rust-lang");
-        assert_eq!(pull_request.repository_name, "cargo");
-        assert_eq!(pull_request.number, 42);
-        assert_eq!(pull_request.state, "open");
-        assert_eq!(pull_request.base_branch.as_deref(), Some("main"));
-        assert_eq!(pull_request.head_branch.as_deref(), Some("topic/coverage"));
-        assert_eq!(pull_request.commits.len(), 2);
-        assert_eq!(pull_request.commits[0].sha, "abc123");
-    }
-
-    #[tokio::test]
-    async fn fetches_additional_commit_pages_for_pull_requests() {
-        let server = MockServer::start().await;
-        let client = test_client(&server);
-
-        mock_graphql_response(
-            &server,
-            "SearchAuthoredPullRequests",
-            Some("\"cursor\":null"),
-            json!({
-                "search": {
-                    "pageInfo": {
-                        "hasNextPage": false,
-                        "endCursor": null
-                    },
-                    "nodes": [
-                        {
-                            "__typename": "PullRequest",
-                            "id": "PR_kwDOAAABc843",
-                            "databaseId": 67890,
-                            "number": 99,
-                            "title": "Handle pagination",
-                            "body": null,
-                            "state": "MERGED",
-                            "createdAt": "2026-03-05T10:00:00Z",
-                            "updatedAt": "2026-03-05T11:00:00Z",
-                            "additions": 8,
-                            "deletions": 1,
-                            "changedFiles": 2,
-                            "baseRefName": "main",
-                            "headRefName": "topic/pagination",
-                            "repository": {
-                                "name": "cargo",
-                                "isPrivate": false,
-                                "owner": { "username": "rust-lang" }
-                            },
-                            "commits": {
-                                "pageInfo": {
-                                    "hasNextPage": true,
-                                    "endCursor": "commit-cursor-1"
-                                },
-                                "nodes": [
-                                    {
-                                        "commit": {
-                                            "oid": "abc123",
-                                            "message": "feat: start pagination handling",
-                                            "authoredDate": "2026-03-05T09:00:00Z",
-                                            "committedDate": "2026-03-05T09:05:00Z"
-                                        }
-                                    }
-                                ]
-                            }
-                        }
-                    ]
-                }
-            }),
-        )
-        .await;
-
-        mock_graphql_response(
-            &server,
-            "PullRequestCommitsPage",
-            Some("\"cursor\":\"commit-cursor-1\""),
-            json!({
-                "node": {
-                    "__typename": "PullRequest",
-                    "repository": {
-                        "name": "cargo",
-                        "isPrivate": false,
-                        "owner": { "username": "rust-lang" }
-                    },
-                    "commits": {
-                        "pageInfo": {
-                            "hasNextPage": false,
-                            "endCursor": null
-                        },
-                        "nodes": [
-                            {
-                                "commit": {
-                                    "oid": "def456",
-                                    "message": "fix: finish pagination handling",
-                                    "authoredDate": "2026-03-05T09:10:00Z",
-                                    "committedDate": "2026-03-05T09:15:00Z"
-                                }
-                            }
-                        ]
-                    }
-                }
-            }),
-        )
-        .await;
-
-        let pull_requests = client
-            .fetch_authored_pull_requests("octocat", 30)
-            .await
-            .expect("pull requests should be fetched");
-
-        assert_eq!(pull_requests.len(), 1);
-        assert_eq!(pull_requests[0].commits.len(), 2);
-        assert_eq!(pull_requests[0].commits[1].sha, "def456");
-    }
-
-    #[tokio::test]
-    async fn skips_private_pull_requests_from_search_results() {
-        let server = MockServer::start().await;
-        let client = test_client(&server);
-
-        mock_graphql_response(
-            &server,
-            "SearchAuthoredPullRequests",
-            Some("\"cursor\":null"),
-            json!({
-                "search": {
-                    "pageInfo": {
-                        "hasNextPage": false,
-                        "endCursor": null
-                    },
-                    "nodes": [
-                        {
-                            "__typename": "PullRequest",
-                            "id": "PR_kwDOAAABc844",
-                            "databaseId": 77,
-                            "number": 7,
-                            "title": "Secret refactor",
-                            "body": "Internal only",
-                            "state": "OPEN",
-                            "createdAt": "2026-03-01T10:00:00Z",
-                            "updatedAt": "2026-03-01T11:00:00Z",
-                            "additions": 10,
-                            "deletions": 2,
-                            "changedFiles": 1,
-                            "baseRefName": "main",
-                            "headRefName": "topic/private",
-                            "repository": {
-                                "name": "secret-repo",
-                                "isPrivate": true,
-                                "owner": { "username": "private-org" }
-                            },
-                            "commits": {
-                                "pageInfo": {
-                                    "hasNextPage": false,
-                                    "endCursor": null
-                                },
-                                "nodes": []
-                            }
-                        }
-                    ]
-                }
-            }),
-        )
-        .await;
-
-        let pull_requests = client
-            .fetch_authored_pull_requests("octocat", 30)
-            .await
-            .expect("pull request fetch should succeed");
-
-        assert!(pull_requests.is_empty());
-    }
-
-    fn test_client(server: &MockServer) -> GitHubClient {
-        GitHubClient::with_base_url(
-            "test-agent",
-            "test-token",
-            Url::parse(&format!("{}/", server.uri())).expect("base URL should parse"),
-        )
-        .expect("test GitHub client should be created")
-    }
-
-    async fn mock_graphql_response(
-        server: &MockServer,
-        operation_name: &str,
-        body_fragment: Option<&str>,
-        data: Value,
-    ) {
-        let body_fragment = body_fragment.unwrap_or_default().to_owned();
-
-        Mock::given(method("POST"))
-            .and(path("/graphql"))
-            .and(body_string_contains(operation_name))
-            .and(body_string_contains(body_fragment))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": data })))
-            .expect(1)
-            .mount(server)
-            .await;
-    }
-}
+mod tests;

@@ -65,7 +65,7 @@ pub(crate) struct SearchPullRequestsData {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SearchConnection {
     pub page_info: GraphQlPageInfo,
-    pub nodes: Vec<Option<SearchResultNode>>,
+    pub nodes: Vec<Option<SearchPullRequestRefNode>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -75,10 +75,28 @@ pub(crate) struct GraphQlPageInfo {
     pub end_cursor: Option<String>,
 }
 
-/// Pull-request-shaped search node returned by GitHub GraphQL search.
+/// Minimal pull-request-shaped search node used only for lightweight discovery.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SearchResultNode {
+pub(crate) struct SearchPullRequestRefNode {
+    #[serde(rename = "__typename")]
+    pub typename: String,
+    pub id: Option<String>,
+    pub number: Option<i64>,
+    pub created_at: Option<String>,
+    pub repository: Option<GraphQlRepository>,
+}
+
+/// Batch details response used after lightweight search discovery.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PullRequestDetailsData {
+    pub nodes: Vec<Option<PullRequestDetailsNode>>,
+}
+
+/// Fully hydrated pull-request node returned by the details batch query.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PullRequestDetailsNode {
     #[serde(rename = "__typename")]
     pub typename: String,
     pub id: Option<String>,

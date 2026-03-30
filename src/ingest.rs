@@ -219,50 +219,71 @@ mod tests {
                         {
                             "__typename": "PullRequest",
                             "id": "PR_kwDOAAABc842",
-                            "databaseId": 9001,
                             "number": 42,
-                            "title": "Improve parser coverage",
-                            "body": "Adds regression tests and cleanup.",
-                            "state": "OPEN",
                             "createdAt": "2026-03-01T10:00:00Z",
-                            "updatedAt": "2026-03-01T11:00:00Z",
-                            "additions": 17,
-                            "deletions": 4,
-                            "changedFiles": 3,
-                            "baseRefName": "main",
-                            "headRefName": "topic/coverage",
                             "repository": {
                                 "name": "cargo",
                                 "isPrivate": false,
                                 "owner": { "username": "rust-lang" }
-                            },
-                            "commits": {
-                                "pageInfo": {
-                                    "hasNextPage": false,
-                                    "endCursor": null
-                                },
-                                "nodes": [
-                                    {
-                                        "commit": {
-                                            "oid": "abc123",
-                                            "message": "test: add parser regression",
-                                            "authoredDate": "2026-03-01T09:00:00Z",
-                                            "committedDate": "2026-03-01T09:05:00Z"
-                                        }
-                                    },
-                                    {
-                                        "commit": {
-                                            "oid": "def456",
-                                            "message": "refactor: simplify fixtures",
-                                            "authoredDate": "2026-03-01T09:10:00Z",
-                                            "committedDate": "2026-03-01T09:15:00Z"
-                                        }
-                                    }
-                                ]
                             }
                         }
                     ]
                 }
+            }),
+        )
+        .await;
+        mock_graphql_response(
+            &server,
+            "PullRequestDetailsBatch",
+            Some("PR_kwDOAAABc842"),
+            json!({
+                "nodes": [
+                    {
+                        "__typename": "PullRequest",
+                        "id": "PR_kwDOAAABc842",
+                        "databaseId": 9001,
+                        "number": 42,
+                        "title": "Improve parser coverage",
+                        "body": "Adds regression tests and cleanup.",
+                        "state": "OPEN",
+                        "createdAt": "2026-03-01T10:00:00Z",
+                        "updatedAt": "2026-03-01T11:00:00Z",
+                        "additions": 17,
+                        "deletions": 4,
+                        "changedFiles": 3,
+                        "baseRefName": "main",
+                        "headRefName": "topic/coverage",
+                        "repository": {
+                            "name": "cargo",
+                            "isPrivate": false,
+                            "owner": { "username": "rust-lang" }
+                        },
+                        "commits": {
+                            "pageInfo": {
+                                "hasNextPage": false,
+                                "endCursor": null
+                            },
+                            "nodes": [
+                                {
+                                    "commit": {
+                                        "oid": "abc123",
+                                        "message": "test: add parser regression",
+                                        "authoredDate": "2026-03-01T09:00:00Z",
+                                        "committedDate": "2026-03-01T09:05:00Z"
+                                    }
+                                },
+                                {
+                                    "commit": {
+                                        "oid": "def456",
+                                        "message": "refactor: simplify fixtures",
+                                        "authoredDate": "2026-03-01T09:10:00Z",
+                                        "committedDate": "2026-03-01T09:15:00Z"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
             }),
         )
         .await;
