@@ -3,11 +3,13 @@ mod schema;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
+
+const PULL_REQUEST_ARTIFACT_KIND: &str = "pull_request";
 
 /// Thin SQLite-backed persistence layer for accounts, artifacts, commits, and sync runs.
 #[derive(Clone)]
@@ -52,6 +54,39 @@ pub struct CommitUpsert<'a> {
     pub committed_at: Option<&'a str>,
 }
 
+/// Typed pull-request shape loaded back from SQLite for analysis and scoring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestReadModel {
+    pub artifact_id: i64,
+    pub account_id: i64,
+    pub username: String,
+    pub repository_owner: String,
+    pub repository_name: String,
+    pub repository_full_name: String,
+    pub external_id: String,
+    pub number: i64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub additions: i64,
+    pub deletions: i64,
+    pub changed_files: i64,
+    pub base_branch: Option<String>,
+    pub head_branch: Option<String>,
+    pub commits: Vec<PullRequestCommitReadModel>,
+}
+
+/// Typed commit shape attached to one stored pull-request read model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestCommitReadModel {
+    pub sha: String,
+    pub message: String,
+    pub authored_at: Option<DateTime<Utc>>,
+    pub committed_at: Option<DateTime<Utc>>,
+}
+
 /// Lifecycle state persisted for a sync run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncRunStatus {
@@ -68,6 +103,17 @@ impl SyncRunStatus {
             Self::Failed => "failed",
         }
     }
+}
+
+fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("invalid RFC3339 timestamp: {value}"))?;
+
+    Ok(parsed.with_timezone(&Utc))
+}
+
+fn parse_optional_timestamp(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    value.map(|value| parse_timestamp(&value)).transpose()
 }
 
 impl Store {
@@ -296,6 +342,169 @@ impl Store {
         Ok(())
     }
 
+    /// Loads stored pull requests for one account inside the requested trailing window.
+    ///
+    /// This is the read-model entrypoint for the Phase 3 analyze-on-read flow. It
+    /// returns fully hydrated pull requests, including their linked commits, so the
+    /// scoring path can derive features without persisting analyzer output.
+    pub async fn load_pull_requests_for_account_window(
+        &self,
+        username: &str,
+        window_days: u16,
+    ) -> Result<Vec<PullRequestReadModel>> {
+        let Some(account) = self.find_account_by_username(username).await? else {
+            return Ok(Vec::new());
+        };
+
+        let cutoff = (Utc::now() - Duration::days(i64::from(window_days))).to_rfc3339();
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                a.id AS artifact_id,
+                a.account_id,
+                acc.username,
+                r.owner AS repository_owner,
+                r.name AS repository_name,
+                r.full_name AS repository_full_name,
+                a.external_id,
+                a.pr_number,
+                a.title,
+                a.body,
+                a.state,
+                a.created_at,
+                a.updated_at,
+                a.additions,
+                a.deletions,
+                a.changed_files,
+                a.base_branch,
+                a.head_branch
+            FROM artifacts a
+            JOIN accounts acc ON acc.id = a.account_id
+            LEFT JOIN repositories r ON r.id = a.repository_id
+            WHERE a.account_id = ?
+              AND a.kind = ?
+              AND datetime(a.created_at) >= datetime(?)
+            ORDER BY datetime(a.created_at) DESC, a.id DESC
+            "#,
+        )
+        .bind(account.id)
+        .bind(PULL_REQUEST_ARTIFACT_KIND)
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load pull requests for username {} in {} day window",
+                username, window_days
+            )
+        })?;
+
+        let mut pull_requests = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let artifact_id = row.get::<i64, _>("artifact_id");
+            let repository_owner =
+                row.get::<Option<String>, _>("repository_owner")
+                    .context(format!(
+                        "pull request artifact {artifact_id} is missing repository owner"
+                    ))?;
+            let repository_name =
+                row.get::<Option<String>, _>("repository_name")
+                    .context(format!(
+                        "pull request artifact {artifact_id} is missing repository name"
+                    ))?;
+            let repository_full_name = row
+                .get::<Option<String>, _>("repository_full_name")
+                .context(format!(
+                    "pull request artifact {artifact_id} is missing repository full name"
+                ))?;
+            let number = row.get::<Option<i64>, _>("pr_number").context(format!(
+                "pull request artifact {artifact_id} is missing pr_number"
+            ))?;
+            let title = row.get::<Option<String>, _>("title").context(format!(
+                "pull request artifact {artifact_id} is missing title"
+            ))?;
+            let state = row.get::<Option<String>, _>("state").context(format!(
+                "pull request artifact {artifact_id} is missing state"
+            ))?;
+            let created_at_raw = row.get::<String, _>("created_at");
+            let updated_at_raw = row.get::<String, _>("updated_at");
+            let commits = self.load_commits_for_artifact(artifact_id).await?;
+
+            pull_requests.push(PullRequestReadModel {
+                artifact_id,
+                account_id: row.get("account_id"),
+                username: row.get("username"),
+                repository_owner,
+                repository_name,
+                repository_full_name,
+                external_id: row.get("external_id"),
+                number,
+                title,
+                body: row.get("body"),
+                state,
+                created_at: parse_timestamp(&created_at_raw).with_context(|| {
+                    format!("failed to parse created_at for pull request artifact {artifact_id}")
+                })?,
+                updated_at: parse_timestamp(&updated_at_raw).with_context(|| {
+                    format!("failed to parse updated_at for pull request artifact {artifact_id}")
+                })?,
+                additions: row.get("additions"),
+                deletions: row.get("deletions"),
+                changed_files: row.get("changed_files"),
+                base_branch: row.get("base_branch"),
+                head_branch: row.get("head_branch"),
+                commits,
+            });
+        }
+
+        Ok(pull_requests)
+    }
+
+    /// Loads the stored commit set for one artifact in a stable analyzer-friendly order.
+    async fn load_commits_for_artifact(
+        &self,
+        artifact_id: i64,
+    ) -> Result<Vec<PullRequestCommitReadModel>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT sha, message, authored_at, committed_at
+            FROM commits
+            WHERE artifact_id = ?
+            ORDER BY datetime(COALESCE(committed_at, authored_at)) ASC, id ASC
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("failed to load commits for artifact {artifact_id}"))?;
+
+        let mut commits = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let sha = row.get::<String, _>("sha");
+            let authored_at_raw = row.get::<Option<String>, _>("authored_at");
+            let committed_at_raw = row.get::<Option<String>, _>("committed_at");
+
+            commits.push(PullRequestCommitReadModel {
+                sha: sha.clone(),
+                message: row.get("message"),
+                authored_at: parse_optional_timestamp(authored_at_raw).with_context(|| {
+                    format!(
+                        "failed to parse authored_at for commit {sha} on artifact {artifact_id}"
+                    )
+                })?,
+                committed_at: parse_optional_timestamp(committed_at_raw).with_context(|| {
+                    format!(
+                        "failed to parse committed_at for commit {sha} on artifact {artifact_id}"
+                    )
+                })?,
+            });
+        }
+
+        Ok(commits)
+    }
+
     /// Creates a new sync-run record before remote ingestion starts.
     pub async fn start_sync_run(&self, account_id: i64, window_days: u16) -> Result<i64> {
         let started_at = Utc::now().to_rfc3339();
@@ -366,9 +575,14 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
     use tempfile::TempDir;
 
-    use super::{ArtifactUpsert, CommitUpsert, Store, SyncRunStatus};
+    use super::{ArtifactUpsert, CommitUpsert, PullRequestReadModel, Store, SyncRunStatus};
+
+    fn relative_timestamp(days_from_now: i64) -> String {
+        (Utc::now() + Duration::days(days_from_now)).to_rfc3339()
+    }
 
     #[tokio::test]
     async fn schema_init_is_idempotent() {
@@ -514,6 +728,179 @@ mod tests {
 
         assert_eq!(commit_count, 1);
         assert_eq!(remaining_sha, "fedcba");
+    }
+
+    #[tokio::test]
+    async fn load_pull_requests_for_account_window_hydrates_commits() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("aislop.db");
+        let store = Store::connect(&db_path)
+            .await
+            .expect("store should connect for test");
+
+        let account_id = store
+            .upsert_account("ogi")
+            .await
+            .expect("account upsert should work");
+        let other_account_id = store
+            .upsert_account("someone-else")
+            .await
+            .expect("other account upsert should work");
+        let repository_id = store
+            .upsert_repository("rust-lang", "cargo")
+            .await
+            .expect("repository upsert should work");
+        let other_repository_id = store
+            .upsert_repository("rust-lang", "rust")
+            .await
+            .expect("other repository upsert should work");
+
+        let current_artifact_id = store
+            .upsert_artifact(&ArtifactUpsert {
+                account_id,
+                repository_id: Some(repository_id),
+                kind: "pull_request",
+                external_id: "9001",
+                pr_number: Some(42),
+                title: Some("Improve parser coverage"),
+                body: Some("Adds regression tests and cleanup."),
+                state: Some("open"),
+                created_at: &relative_timestamp(-5),
+                updated_at: &relative_timestamp(-4),
+                additions: 17,
+                deletions: 4,
+                changed_files: 3,
+                base_branch: Some("main"),
+                head_branch: Some("topic/coverage"),
+            })
+            .await
+            .expect("current artifact upsert should work");
+        let _older_artifact_id = store
+            .upsert_artifact(&ArtifactUpsert {
+                account_id,
+                repository_id: Some(repository_id),
+                kind: "pull_request",
+                external_id: "9002",
+                pr_number: Some(43),
+                title: Some("Old pull request"),
+                body: Some("Outside the current score window."),
+                state: Some("closed"),
+                created_at: &relative_timestamp(-120),
+                updated_at: &relative_timestamp(-119),
+                additions: 3,
+                deletions: 1,
+                changed_files: 1,
+                base_branch: Some("main"),
+                head_branch: Some("topic/old"),
+            })
+            .await
+            .expect("older artifact upsert should work");
+        let _issue_artifact_id = store
+            .upsert_artifact(&ArtifactUpsert {
+                account_id,
+                repository_id: Some(repository_id),
+                kind: "issue",
+                external_id: "issue-1",
+                pr_number: None,
+                title: Some("Not a pull request"),
+                body: Some("Should not show up in the pull-request read model."),
+                state: Some("open"),
+                created_at: &relative_timestamp(-2),
+                updated_at: &relative_timestamp(-2),
+                additions: 0,
+                deletions: 0,
+                changed_files: 0,
+                base_branch: None,
+                head_branch: None,
+            })
+            .await
+            .expect("issue artifact upsert should work");
+        let _other_account_artifact_id = store
+            .upsert_artifact(&ArtifactUpsert {
+                account_id: other_account_id,
+                repository_id: Some(other_repository_id),
+                kind: "pull_request",
+                external_id: "9003",
+                pr_number: Some(44),
+                title: Some("Other account pull request"),
+                body: Some("Should not show up for the requested account."),
+                state: Some("open"),
+                created_at: &relative_timestamp(-1),
+                updated_at: &relative_timestamp(-1),
+                additions: 9,
+                deletions: 2,
+                changed_files: 2,
+                base_branch: Some("main"),
+                head_branch: Some("topic/other"),
+            })
+            .await
+            .expect("other account artifact upsert should work");
+
+        store
+            .upsert_commit(&CommitUpsert {
+                artifact_id: current_artifact_id,
+                sha: "abc123",
+                message: "test: add parser regression",
+                authored_at: Some(&relative_timestamp(-6)),
+                committed_at: Some(&relative_timestamp(-6)),
+            })
+            .await
+            .expect("first commit upsert should work");
+        store
+            .upsert_commit(&CommitUpsert {
+                artifact_id: current_artifact_id,
+                sha: "def456",
+                message: "refactor: simplify fixtures",
+                authored_at: Some(&relative_timestamp(-5)),
+                committed_at: Some(&relative_timestamp(-5)),
+            })
+            .await
+            .expect("second commit upsert should work");
+
+        let pull_requests = store
+            .load_pull_requests_for_account_window("ogi", 90)
+            .await
+            .expect("pull requests should load");
+
+        assert_eq!(pull_requests.len(), 1);
+
+        let pull_request: &PullRequestReadModel = &pull_requests[0];
+        assert_eq!(pull_request.artifact_id, current_artifact_id);
+        assert_eq!(pull_request.username, "ogi");
+        assert_eq!(pull_request.repository_owner, "rust-lang");
+        assert_eq!(pull_request.repository_name, "cargo");
+        assert_eq!(pull_request.repository_full_name, "rust-lang/cargo");
+        assert_eq!(pull_request.number, 42);
+        assert_eq!(pull_request.title, "Improve parser coverage");
+        assert_eq!(
+            pull_request.body.as_deref(),
+            Some("Adds regression tests and cleanup.")
+        );
+        assert_eq!(pull_request.state, "open");
+        assert_eq!(pull_request.additions, 17);
+        assert_eq!(pull_request.deletions, 4);
+        assert_eq!(pull_request.changed_files, 3);
+        assert_eq!(pull_request.base_branch.as_deref(), Some("main"));
+        assert_eq!(pull_request.head_branch.as_deref(), Some("topic/coverage"));
+        assert_eq!(pull_request.commits.len(), 2);
+        assert_eq!(pull_request.commits[0].sha, "abc123");
+        assert_eq!(pull_request.commits[1].sha, "def456");
+    }
+
+    #[tokio::test]
+    async fn load_pull_requests_for_unknown_account_returns_empty() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let db_path = temp_dir.path().join("aislop.db");
+        let store = Store::connect(&db_path)
+            .await
+            .expect("store should connect for test");
+
+        let pull_requests = store
+            .load_pull_requests_for_account_window("missing", 90)
+            .await
+            .expect("unknown account lookup should not fail");
+
+        assert!(pull_requests.is_empty());
     }
 
     #[tokio::test]
