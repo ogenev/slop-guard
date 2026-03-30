@@ -21,7 +21,7 @@ pub fn aggregate(features: &[ArtifactFeatures]) -> AccountFeatureWindow {
         .sum();
     let explicit_marker_hits = features
         .iter()
-        .filter(|feature| !feature.evidence.is_empty())
+        .filter(|feature| feature.has_explicit_marker)
         .count();
     let artifact_count_f32 = artifact_count as f32;
 
@@ -35,15 +35,22 @@ pub fn aggregate(features: &[ArtifactFeatures]) -> AccountFeatureWindow {
 
 #[cfg(test)]
 mod tests {
-    use crate::analyzers::{Analyzer, ArtifactFeatures, ExplicitMarkerAnalyzer};
+    use crate::{analyzers::ArtifactFeatures, domain::EvidenceItem};
 
     use super::aggregate;
 
     #[test]
     fn aggregates_explicit_marker_ratio() {
-        let analyzer = ExplicitMarkerAnalyzer;
         let features = vec![
-            analyzer.analyze("Generated with Claude Code"),
+            ArtifactFeatures {
+                has_explicit_marker: true,
+                ai_signal_score: 1.0,
+                slop_signal_score: 0.0,
+                evidence: vec![EvidenceItem {
+                    summary: "Explicit AI marker detected in pull request body".to_owned(),
+                    weight: 1.0,
+                }],
+            },
             ArtifactFeatures::default(),
         ];
 
@@ -51,5 +58,21 @@ mod tests {
 
         assert_eq!(aggregated.artifact_count, 2);
         assert_eq!(aggregated.explicit_marker_ratio, 0.5);
+    }
+
+    #[test]
+    fn ignores_non_marker_evidence_when_aggregating_marker_ratio() {
+        let aggregated = aggregate(&[ArtifactFeatures {
+            has_explicit_marker: false,
+            ai_signal_score: 0.0,
+            slop_signal_score: 0.25,
+            evidence: vec![EvidenceItem {
+                summary: "Oversized pull request heuristic triggered".to_owned(),
+                weight: 0.25,
+            }],
+        }]);
+
+        assert_eq!(aggregated.artifact_count, 1);
+        assert_eq!(aggregated.explicit_marker_ratio, 0.0);
     }
 }

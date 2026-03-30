@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::analyzers::{Analyzer, ExplicitMarkerAnalyzer};
+use crate::analyzers::analyze_pull_requests;
 use crate::features::aggregate;
 use crate::github::GitHubClient;
 use crate::ingest::IngestService;
@@ -56,7 +56,7 @@ pub async fn run() -> Result<()> {
             window_days,
         } => {
             let database_path = resolve_database_path(db_path)?;
-            score_account(&database_path, username, window_days)?
+            score_account(&database_path, username, window_days).await?
         }
         Command::ShowLayout => show_layout()?,
     }
@@ -88,14 +88,14 @@ async fn sync_account(database_path: &Path, username: String, days: u16) -> Resu
     Ok(())
 }
 
-/// Scores an account window using the currently wired analyzer/aggregation scaffold.
-fn score_account(_database_path: &Path, username: String, window_days: u16) -> Result<()> {
-    let analyzer = ExplicitMarkerAnalyzer;
-    let artifacts = vec![
-        analyzer.analyze("Generated with Claude Code"),
-        analyzer.analyze("Routine contributor follow-up"),
-    ];
-    let window = aggregate(&artifacts);
+/// Scores an account window from stored SQLite artifacts using the analyze-on-read flow.
+async fn score_account(database_path: &Path, username: String, window_days: u16) -> Result<()> {
+    let store = Store::connect(database_path).await?;
+    let artifacts = store
+        .load_pull_requests_for_account_window(&username, window_days)
+        .await?;
+    let analyzed_artifacts = analyze_pull_requests(&artifacts);
+    let window = aggregate(&analyzed_artifacts);
     let engine = ScoreEngine;
     let score = engine.score(&username, window_days, &window);
 
