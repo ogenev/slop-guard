@@ -1,4 +1,7 @@
+pub(crate) mod queries;
 mod schema;
+#[cfg(test)]
+pub(crate) mod test_queries;
 
 use std::path::Path;
 
@@ -167,36 +170,22 @@ impl Store {
 
     /// Inserts or refreshes an account row and returns its stable identifier.
     pub async fn upsert_account(&self, username: &str) -> Result<i64> {
-        let id = sqlx::query_scalar::<_, i64>(
-            r#"
-            INSERT INTO accounts (username)
-            VALUES (?)
-            ON CONFLICT(username) DO UPDATE SET
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            RETURNING id
-            "#,
-        )
-        .bind(username)
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| format!("failed to upsert account with username {username}"))?;
+        let id = sqlx::query_scalar::<_, i64>(queries::UPSERT_ACCOUNT_QUERY)
+            .bind(username)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("failed to upsert account with username {username}"))?;
 
         Ok(id)
     }
 
     /// Looks up an account by username if it has already been seen locally.
     pub async fn find_account_by_username(&self, username: &str) -> Result<Option<AccountRecord>> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, username
-            FROM accounts
-            WHERE username = ?
-            "#,
-        )
-        .bind(username)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("failed to lookup account with username {username}"))?;
+        let row = sqlx::query(queries::FIND_ACCOUNT_BY_USERNAME_QUERY)
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| format!("failed to lookup account with username {username}"))?;
 
         Ok(row.map(|row| AccountRecord {
             id: row.get("id"),
@@ -208,136 +197,69 @@ impl Store {
     pub async fn upsert_repository(&self, owner: &str, name: &str) -> Result<i64> {
         let full_name = format!("{owner}/{name}");
 
-        let id = sqlx::query_scalar::<_, i64>(
-            r#"
-            INSERT INTO repositories (owner, name, full_name)
-            VALUES (?, ?, ?)
-            ON CONFLICT(full_name) DO UPDATE SET
-                owner = excluded.owner,
-                name = excluded.name,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            RETURNING id
-            "#,
-        )
-        .bind(owner)
-        .bind(name)
-        .bind(full_name)
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| format!("failed to upsert repository {owner}/{name}"))?;
+        let id = sqlx::query_scalar::<_, i64>(queries::UPSERT_REPOSITORY_QUERY)
+            .bind(owner)
+            .bind(name)
+            .bind(full_name)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("failed to upsert repository {owner}/{name}"))?;
 
         Ok(id)
     }
 
     /// Inserts or refreshes a normalized artifact and returns its row identifier.
     pub async fn upsert_artifact(&self, input: &ArtifactUpsert<'_>) -> Result<i64> {
-        let id = sqlx::query_scalar::<_, i64>(
-            r#"
-            INSERT INTO artifacts (
-                account_id,
-                repository_id,
-                kind,
-                external_id,
-                pr_number,
-                title,
-                body,
-                state,
-                created_at,
-                updated_at,
-                additions,
-                deletions,
-                changed_files,
-                base_branch,
-                head_branch
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(kind, external_id) DO UPDATE SET
-                account_id = excluded.account_id,
-                repository_id = excluded.repository_id,
-                pr_number = excluded.pr_number,
-                title = excluded.title,
-                body = excluded.body,
-                state = excluded.state,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                additions = excluded.additions,
-                deletions = excluded.deletions,
-                changed_files = excluded.changed_files,
-                base_branch = excluded.base_branch,
-                head_branch = excluded.head_branch
-            RETURNING id
-            "#,
-        )
-        .bind(input.account_id)
-        .bind(input.repository_id)
-        .bind(input.kind)
-        .bind(input.external_id)
-        .bind(input.pr_number)
-        .bind(input.title)
-        .bind(input.body)
-        .bind(input.state)
-        .bind(input.created_at)
-        .bind(input.updated_at)
-        .bind(input.additions)
-        .bind(input.deletions)
-        .bind(input.changed_files)
-        .bind(input.base_branch)
-        .bind(input.head_branch)
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to upsert artifact kind={} external_id={}",
-                input.kind, input.external_id
-            )
-        })?;
+        let id = sqlx::query_scalar::<_, i64>(queries::UPSERT_ARTIFACT_QUERY)
+            .bind(input.account_id)
+            .bind(input.repository_id)
+            .bind(input.kind)
+            .bind(input.external_id)
+            .bind(input.pr_number)
+            .bind(input.title)
+            .bind(input.body)
+            .bind(input.state)
+            .bind(input.created_at)
+            .bind(input.updated_at)
+            .bind(input.additions)
+            .bind(input.deletions)
+            .bind(input.changed_files)
+            .bind(input.base_branch)
+            .bind(input.head_branch)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to upsert artifact kind={} external_id={}",
+                    input.kind, input.external_id
+                )
+            })?;
 
         Ok(id)
     }
 
     /// Inserts or refreshes a commit row for an artifact and returns its row identifier.
     pub async fn upsert_commit(&self, input: &CommitUpsert<'_>) -> Result<i64> {
-        let id = sqlx::query_scalar::<_, i64>(
-            r#"
-            INSERT INTO commits (
-                artifact_id,
-                sha,
-                message,
-                authored_at,
-                committed_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(artifact_id, sha) DO UPDATE SET
-                message = excluded.message,
-                authored_at = excluded.authored_at,
-                committed_at = excluded.committed_at
-            RETURNING id
-            "#,
-        )
-        .bind(input.artifact_id)
-        .bind(input.sha)
-        .bind(input.message)
-        .bind(input.authored_at)
-        .bind(input.committed_at)
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| format!("failed to upsert commit {}", input.sha))?;
+        let id = sqlx::query_scalar::<_, i64>(queries::UPSERT_COMMIT_QUERY)
+            .bind(input.artifact_id)
+            .bind(input.sha)
+            .bind(input.message)
+            .bind(input.authored_at)
+            .bind(input.committed_at)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("failed to upsert commit {}", input.sha))?;
 
         Ok(id)
     }
 
     /// Deletes all commits currently associated with an artifact.
     pub async fn delete_commits_for_artifact(&self, artifact_id: i64) -> Result<()> {
-        sqlx::query(
-            r#"
-            DELETE FROM commits
-            WHERE artifact_id = ?
-            "#,
-        )
-        .bind(artifact_id)
-        .execute(&self.pool)
-        .await
-        .with_context(|| format!("failed to delete commits for artifact {artifact_id}"))?;
+        sqlx::query(queries::DELETE_COMMITS_FOR_ARTIFACT_QUERY)
+            .bind(artifact_id)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to delete commits for artifact {artifact_id}"))?;
 
         Ok(())
     }
@@ -357,47 +279,18 @@ impl Store {
         };
 
         let cutoff = (Utc::now() - Duration::days(i64::from(window_days))).to_rfc3339();
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                a.id AS artifact_id,
-                a.account_id,
-                acc.username,
-                r.owner AS repository_owner,
-                r.name AS repository_name,
-                r.full_name AS repository_full_name,
-                a.external_id,
-                a.pr_number,
-                a.title,
-                a.body,
-                a.state,
-                a.created_at,
-                a.updated_at,
-                a.additions,
-                a.deletions,
-                a.changed_files,
-                a.base_branch,
-                a.head_branch
-            FROM artifacts a
-            JOIN accounts acc ON acc.id = a.account_id
-            LEFT JOIN repositories r ON r.id = a.repository_id
-            WHERE a.account_id = ?
-              AND a.kind = ?
-              AND datetime(a.created_at) >= datetime(?)
-            ORDER BY datetime(a.created_at) DESC, a.id DESC
-            "#,
-        )
-        .bind(account.id)
-        .bind(PULL_REQUEST_ARTIFACT_KIND)
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to load pull requests for username {} in {} day window",
-                username, window_days
-            )
-        })?;
+        let rows = sqlx::query(queries::LOAD_PULL_REQUESTS_FOR_ACCOUNT_WINDOW_QUERY)
+            .bind(account.id)
+            .bind(PULL_REQUEST_ARTIFACT_KIND)
+            .bind(cutoff)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load pull requests for username {} in {} day window",
+                    username, window_days
+                )
+            })?;
 
         let mut pull_requests = Vec::with_capacity(rows.len());
 
@@ -466,18 +359,11 @@ impl Store {
         &self,
         artifact_id: i64,
     ) -> Result<Vec<PullRequestCommitReadModel>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT sha, message, authored_at, committed_at
-            FROM commits
-            WHERE artifact_id = ?
-            ORDER BY datetime(COALESCE(committed_at, authored_at)) ASC, id ASC
-            "#,
-        )
-        .bind(artifact_id)
-        .fetch_all(&self.pool)
-        .await
-        .with_context(|| format!("failed to load commits for artifact {artifact_id}"))?;
+        let rows = sqlx::query(queries::LOAD_COMMITS_FOR_ARTIFACT_QUERY)
+            .bind(artifact_id)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to load commits for artifact {artifact_id}"))?;
 
         let mut commits = Vec::with_capacity(rows.len());
 
@@ -509,30 +395,19 @@ impl Store {
     pub async fn start_sync_run(&self, account_id: i64, window_days: u16) -> Result<i64> {
         let started_at = Utc::now().to_rfc3339();
 
-        let run_id = sqlx::query_scalar::<_, i64>(
-            r#"
-            INSERT INTO sync_runs (
-                account_id,
-                window_days,
-                status,
-                started_at
-            )
-            VALUES (?, ?, ?, ?)
-            RETURNING id
-            "#,
-        )
-        .bind(account_id)
-        .bind(i64::from(window_days))
-        .bind(SyncRunStatus::Running.as_str())
-        .bind(started_at)
-        .fetch_one(&self.pool)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create sync run for account_id={} window_days={}",
-                account_id, window_days
-            )
-        })?;
+        let run_id = sqlx::query_scalar::<_, i64>(queries::START_SYNC_RUN_QUERY)
+            .bind(account_id)
+            .bind(i64::from(window_days))
+            .bind(SyncRunStatus::Running.as_str())
+            .bind(started_at)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create sync run for account_id={} window_days={}",
+                    account_id, window_days
+                )
+            })?;
 
         Ok(run_id)
     }
@@ -548,26 +423,16 @@ impl Store {
     ) -> Result<()> {
         let finished_at = Utc::now().to_rfc3339();
 
-        sqlx::query(
-            r#"
-            UPDATE sync_runs
-            SET status = ?,
-                finished_at = ?,
-                artifacts_discovered = ?,
-                artifacts_stored = ?,
-                error_message = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(status.as_str())
-        .bind(finished_at)
-        .bind(artifacts_discovered)
-        .bind(artifacts_stored)
-        .bind(error_message)
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .with_context(|| format!("failed to finish sync run {run_id}"))?;
+        sqlx::query(queries::FINISH_SYNC_RUN_QUERY)
+            .bind(status.as_str())
+            .bind(finished_at)
+            .bind(artifacts_discovered)
+            .bind(artifacts_stored)
+            .bind(error_message)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to finish sync run {run_id}"))?;
 
         Ok(())
     }
@@ -578,7 +443,9 @@ mod tests {
     use chrono::{Duration, Utc};
     use tempfile::TempDir;
 
-    use super::{ArtifactUpsert, CommitUpsert, PullRequestReadModel, Store, SyncRunStatus};
+    use super::{
+        ArtifactUpsert, CommitUpsert, PullRequestReadModel, Store, SyncRunStatus, test_queries,
+    };
 
     fn relative_timestamp(days_from_now: i64) -> String {
         (Utc::now() + Duration::days(days_from_now)).to_rfc3339()
@@ -596,17 +463,10 @@ mod tests {
             .await
             .expect("second schema init should be idempotent");
 
-        let table_count: i64 = sqlx::query_scalar(
-            "
-            SELECT COUNT(*)
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name IN ('accounts', 'repositories', 'artifacts', 'commits', 'sync_runs')
-            ",
-        )
-        .fetch_one(first.pool())
-        .await
-        .expect("schema tables should be queryable");
+        let table_count: i64 = sqlx::query_scalar(test_queries::COUNT_SCHEMA_TABLES_QUERY)
+            .fetch_one(first.pool())
+            .await
+            .expect("schema tables should be queryable");
 
         assert_eq!(table_count, 5);
     }
@@ -713,14 +573,13 @@ mod tests {
             .await
             .expect("replacement commit upsert should work");
 
-        let commit_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM commits WHERE artifact_id = ?")
-                .bind(artifact_id)
-                .fetch_one(store.pool())
-                .await
-                .expect("commit count should be queryable");
+        let commit_count: i64 = sqlx::query_scalar(test_queries::COUNT_COMMITS_FOR_ARTIFACT_QUERY)
+            .bind(artifact_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("commit count should be queryable");
         let remaining_sha: String =
-            sqlx::query_scalar("SELECT sha FROM commits WHERE artifact_id = ?")
+            sqlx::query_scalar(test_queries::SELECT_COMMIT_SHA_FOR_ARTIFACT_QUERY)
                 .bind(artifact_id)
                 .fetch_one(store.pool())
                 .await
@@ -925,14 +784,14 @@ mod tests {
             .await
             .expect("sync run should finish");
 
-        let status: String = sqlx::query_scalar("SELECT status FROM sync_runs WHERE id = ?")
+        let status: String = sqlx::query_scalar(test_queries::SELECT_SYNC_RUN_STATUS_BY_ID_QUERY)
             .bind(run_id)
             .fetch_one(store.pool())
             .await
             .expect("sync run status should be queryable");
 
         let finished_at: Option<String> =
-            sqlx::query_scalar("SELECT finished_at FROM sync_runs WHERE id = ?")
+            sqlx::query_scalar(test_queries::SELECT_SYNC_RUN_FINISHED_AT_BY_ID_QUERY)
                 .bind(run_id)
                 .fetch_one(store.pool())
                 .await

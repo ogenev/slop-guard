@@ -1,0 +1,6 @@
+query AccountLookup($username: String!) {
+  repositoryOwner(login: $username) {
+    __typename
+    username: login
+  }
+}

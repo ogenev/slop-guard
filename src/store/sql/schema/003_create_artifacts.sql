@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    repository_id INTEGER,
+    kind TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    pr_number INTEGER,
+    title TEXT,
+    body TEXT,
+    state TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    additions INTEGER NOT NULL DEFAULT 0,
+    deletions INTEGER NOT NULL DEFAULT 0,
+    changed_files INTEGER NOT NULL DEFAULT 0,
+    base_branch TEXT,
+    head_branch TEXT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE SET NULL,
+    UNIQUE (kind, external_id)
+)

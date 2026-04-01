@@ -1,0 +1,41 @@
+query PullRequestDetailsBatch($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    ... on PullRequest {
+      id
+      databaseId
+      number
+      title
+      body
+      state
+      createdAt
+      updatedAt
+      additions
+      deletions
+      changedFiles
+      baseRefName
+      headRefName
+      repository {
+        name
+        isPrivate
+        owner {
+          username: login
+        }
+      }
+      commits(first: 100) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          commit {
+            oid
+            message
+            authoredDate
+            committedDate
+          }
+        }
+      }
+    }
+  }
+}

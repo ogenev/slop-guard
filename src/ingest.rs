@@ -197,7 +197,10 @@ mod tests {
         matchers::{body_string_contains, method, path},
     };
 
-    use crate::{github::GitHubClient, store::Store};
+    use crate::{
+        github::GitHubClient,
+        store::{Store, test_queries},
+    };
 
     use super::IngestService;
 
@@ -305,22 +308,20 @@ mod tests {
         assert_eq!(summary.artifacts_stored, 1);
         assert_eq!(summary.commits_stored, 2);
 
-        let repository_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories")
+        let repository_count: i64 = sqlx::query_scalar(test_queries::COUNT_REPOSITORIES_QUERY)
             .fetch_one(store.pool())
             .await
             .expect("repository count should be queryable");
-        let artifact_row = sqlx::query(
-            "SELECT kind, external_id, title, additions, deletions, changed_files FROM artifacts",
-        )
-        .fetch_one(store.pool())
-        .await
-        .expect("artifact row should be queryable");
-        let commit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM commits")
+        let artifact_row = sqlx::query(test_queries::SELECT_ARTIFACT_STORAGE_SUMMARY_QUERY)
+            .fetch_one(store.pool())
+            .await
+            .expect("artifact row should be queryable");
+        let commit_count: i64 = sqlx::query_scalar(test_queries::COUNT_COMMITS_QUERY)
             .fetch_one(store.pool())
             .await
             .expect("commit count should be queryable");
         let sync_status: String =
-            sqlx::query_scalar("SELECT status FROM sync_runs ORDER BY id DESC LIMIT 1")
+            sqlx::query_scalar(test_queries::SELECT_LATEST_SYNC_RUN_STATUS_QUERY)
                 .fetch_one(store.pool())
                 .await
                 .expect("sync status should be queryable");
@@ -372,16 +373,14 @@ mod tests {
             .await
             .expect("sync should succeed without pull requests");
 
-        let artifact_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts")
+        let artifact_count: i64 = sqlx::query_scalar(test_queries::COUNT_ARTIFACTS_QUERY)
             .fetch_one(store.pool())
             .await
             .expect("artifact count should be queryable");
-        let row = sqlx::query(
-            "SELECT status, artifacts_discovered, artifacts_stored, error_message FROM sync_runs ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_one(store.pool())
-        .await
-        .expect("sync run row should be queryable");
+        let row = sqlx::query(test_queries::SELECT_LATEST_SYNC_RUN_OUTCOME_QUERY)
+            .fetch_one(store.pool())
+            .await
+            .expect("sync run row should be queryable");
 
         assert_eq!(summary.artifacts_discovered, 0);
         assert_eq!(summary.artifacts_stored, 0);
@@ -419,12 +418,10 @@ mod tests {
             .await
             .expect_err("sync should fail for a missing user");
 
-        let row = sqlx::query(
-            "SELECT status, artifacts_discovered, artifacts_stored, error_message FROM sync_runs ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_one(store.pool())
-        .await
-        .expect("sync run row should be queryable");
+        let row = sqlx::query(test_queries::SELECT_LATEST_SYNC_RUN_OUTCOME_QUERY)
+            .fetch_one(store.pool())
+            .await
+            .expect("sync run row should be queryable");
 
         assert!(error.to_string().contains("does not exist"));
         assert_eq!(row.get::<String, _>("status"), "failed");

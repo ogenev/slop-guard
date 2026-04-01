@@ -1,0 +1,22 @@
+query SearchAuthoredPullRequests($query: String!, $cursor: String) {
+  search(query: $query, type: ISSUE, first: 50, after: $cursor) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      __typename
+      ... on PullRequest {
+        id
+        number
+        repository {
+          name
+          isPrivate
+          owner {
+            username: login
+          }
+        }
+      }
+    }
+  }
+}

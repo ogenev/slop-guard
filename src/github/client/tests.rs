@@ -7,9 +7,9 @@ use wiremock::{
     matchers::{body_string_contains, method, path},
 };
 
-use super::{
-    DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY, GitHubClient, SEARCH_AUTHORED_PULL_REQUESTS_QUERY,
-};
+use crate::github::queries::SEARCH_AUTHORED_PULL_REQUESTS_QUERY;
+
+use super::{DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY, GitHubClient};
 
 #[test]
 fn authored_pull_request_search_uses_larger_page_size() {

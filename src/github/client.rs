@@ -13,127 +13,22 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
-use super::models::{
-    AccountLookupData, GraphQlCommitConnection, GraphQlError, GraphQlPullRequestCommitNode,
-    GraphQlRepository, GraphQlResponse, NormalizedCommit, NormalizedPullRequest,
-    PullRequestCommitsPageData, PullRequestDetailsData, PullRequestDetailsNode,
-    SearchPullRequestRefNode, SearchPullRequestsData,
+use super::{
+    models::{
+        AccountLookupData, GraphQlCommitConnection, GraphQlError, GraphQlPullRequestCommitNode,
+        GraphQlRepository, GraphQlResponse, NormalizedCommit, NormalizedPullRequest,
+        PullRequestCommitsPageData, PullRequestDetailsData, PullRequestDetailsNode,
+        SearchPullRequestRefNode, SearchPullRequestsData,
+    },
+    queries::{
+        ACCOUNT_LOOKUP_QUERY, PULL_REQUEST_COMMITS_PAGE_QUERY, PULL_REQUEST_DETAILS_QUERY,
+        SEARCH_AUTHORED_PULL_REQUESTS_QUERY,
+    },
 };
 
 const DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const GITHUB_GRAPHQL_ACCEPT_HEADER: &str = "application/json";
-
-// GitHub's schema still exposes `login`; we alias it to `username` so the rest
-// of the codebase can consistently use our preferred terminology.
-const ACCOUNT_LOOKUP_QUERY: &str = r#"
-query AccountLookup($username: String!) {
-  repositoryOwner(login: $username) {
-    __typename
-    username: login
-  }
-}
-"#;
-
-const SEARCH_AUTHORED_PULL_REQUESTS_QUERY: &str = r#"
-query SearchAuthoredPullRequests($query: String!, $cursor: String) {
-  search(query: $query, type: ISSUE, first: 50, after: $cursor) {
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
-    nodes {
-      __typename
-      ... on PullRequest {
-        id
-        number
-        repository {
-          name
-          isPrivate
-          owner {
-            username: login
-          }
-        }
-      }
-    }
-  }
-}
-"#;
-
-const PULL_REQUEST_DETAILS_QUERY: &str = r#"
-query PullRequestDetailsBatch($ids: [ID!]!) {
-  nodes(ids: $ids) {
-    __typename
-    ... on PullRequest {
-      id
-      databaseId
-      number
-      title
-      body
-      state
-      createdAt
-      updatedAt
-      additions
-      deletions
-      changedFiles
-      baseRefName
-      headRefName
-      repository {
-        name
-        isPrivate
-        owner {
-          username: login
-        }
-      }
-      commits(first: 100) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        nodes {
-          commit {
-            oid
-            message
-            authoredDate
-            committedDate
-          }
-        }
-      }
-    }
-  }
-}
-"#;
-
-const PULL_REQUEST_COMMITS_PAGE_QUERY: &str = r#"
-query PullRequestCommitsPage($pullRequestId: ID!, $cursor: String) {
-  node(id: $pullRequestId) {
-    __typename
-    ... on PullRequest {
-      repository {
-        name
-        isPrivate
-        owner {
-          username: login
-        }
-      }
-      commits(first: 100, after: $cursor) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        nodes {
-          commit {
-            oid
-            message
-            authoredDate
-            committedDate
-          }
-        }
-      }
-    }
-  }
-}
-"#;
 
 const PULL_REQUEST_DETAILS_BATCH_SIZE: usize = 20;
 
