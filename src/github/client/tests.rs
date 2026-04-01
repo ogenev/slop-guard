@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use reqwest::Url;
 use serde_json::{Value, json};
 use wiremock::{
@@ -5,7 +7,15 @@ use wiremock::{
     matchers::{body_string_contains, method, path},
 };
 
-use super::GitHubClient;
+use super::{
+    DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY, GitHubClient, SEARCH_AUTHORED_PULL_REQUESTS_QUERY,
+};
+
+#[test]
+fn authored_pull_request_search_uses_larger_page_size() {
+    assert!(SEARCH_AUTHORED_PULL_REQUESTS_QUERY.contains("first: 50"));
+    assert!(!SEARCH_AUTHORED_PULL_REQUESTS_QUERY.contains("createdAt"));
+}
 
 #[test]
 fn debug_output_redacts_the_github_token() {
@@ -16,6 +26,26 @@ fn debug_output_redacts_the_github_token() {
 
     assert!(debug_output.contains("<redacted>"));
     assert!(!debug_output.contains("super-secret-token"));
+}
+
+#[test]
+fn configures_pull_request_details_concurrency() {
+    let client = GitHubClient::new("test-agent", "super-secret-token")
+        .expect("test GitHub client should be created");
+    assert_eq!(
+        client.pull_request_details_concurrency(),
+        DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY
+    );
+
+    let client = client
+        .with_pull_request_details_concurrency(8)
+        .expect("custom concurrency should be accepted");
+    assert_eq!(client.pull_request_details_concurrency(), 8);
+
+    let error = client
+        .with_pull_request_details_concurrency(0)
+        .expect_err("zero concurrency should be rejected");
+    assert!(error.to_string().contains("at least 1"));
 }
 
 #[tokio::test]
@@ -297,6 +327,68 @@ async fn fetches_additional_commit_pages_for_pull_requests() {
 }
 
 #[tokio::test]
+async fn hydrates_pull_request_details_batches_concurrently() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let discovered_nodes = (0..40)
+        .map(discovered_pull_request_node)
+        .collect::<Vec<_>>();
+    let first_batch_details = (0..20).map(hydrated_pull_request_node).collect::<Vec<_>>();
+    let second_batch_details = (20..40).map(hydrated_pull_request_node).collect::<Vec<_>>();
+
+    mock_graphql_response(
+        &server,
+        "SearchAuthoredPullRequests",
+        Some("\"cursor\":null"),
+        json!({
+            "search": {
+                "pageInfo": {
+                    "hasNextPage": false,
+                    "endCursor": null
+                },
+                "nodes": discovered_nodes
+            }
+        }),
+    )
+    .await;
+    mock_graphql_response_with_template(
+        &server,
+        "PullRequestDetailsBatch",
+        Some("PR_batch_00"),
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_millis(750))
+            .set_body_json(json!({ "data": { "nodes": first_batch_details } })),
+    )
+    .await;
+    mock_graphql_response_with_template(
+        &server,
+        "PullRequestDetailsBatch",
+        Some("PR_batch_20"),
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_millis(750))
+            .set_body_json(json!({ "data": { "nodes": second_batch_details } })),
+    )
+    .await;
+
+    let started_at = Instant::now();
+    let pull_requests = client
+        .fetch_authored_pull_requests("octocat", 30)
+        .await
+        .expect("pull requests should be fetched");
+    let elapsed = started_at.elapsed();
+
+    assert_eq!(pull_requests.len(), 40);
+    assert_eq!(pull_requests[0].external_id, "1000");
+    assert_eq!(pull_requests[19].external_id, "1019");
+    assert_eq!(pull_requests[20].external_id, "1020");
+    assert_eq!(pull_requests[39].external_id, "1039");
+    assert!(
+        elapsed < Duration::from_millis(1300),
+        "expected detail batches to overlap, but fetch took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn skips_private_pull_requests_from_search_results() {
     let server = MockServer::start().await;
     let client = test_client(&server);
@@ -337,6 +429,51 @@ async fn skips_private_pull_requests_from_search_results() {
     assert!(pull_requests.is_empty());
 }
 
+fn discovered_pull_request_node(index: usize) -> Value {
+    json!({
+        "__typename": "PullRequest",
+        "id": format!("PR_batch_{index:02}"),
+        "number": index as i64 + 1,
+        "createdAt": format!("2026-03-{:02}T10:00:00Z", (index % 28) + 1),
+        "repository": {
+            "name": "cargo",
+            "isPrivate": false,
+            "owner": { "username": "rust-lang" }
+        }
+    })
+}
+
+fn hydrated_pull_request_node(index: usize) -> Value {
+    json!({
+        "__typename": "PullRequest",
+        "id": format!("PR_batch_{index:02}"),
+        "databaseId": 1000 + index as i64,
+        "number": index as i64 + 1,
+        "title": format!("Batch pull request {index}"),
+        "body": null,
+        "state": "OPEN",
+        "createdAt": format!("2026-03-{:02}T10:00:00Z", (index % 28) + 1),
+        "updatedAt": format!("2026-03-{:02}T11:00:00Z", (index % 28) + 1),
+        "additions": 1,
+        "deletions": 0,
+        "changedFiles": 1,
+        "baseRefName": "main",
+        "headRefName": format!("topic/batch-{index}"),
+        "repository": {
+            "name": "cargo",
+            "isPrivate": false,
+            "owner": { "username": "rust-lang" }
+        },
+        "commits": {
+            "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+            },
+            "nodes": []
+        }
+    })
+}
+
 fn test_client(server: &MockServer) -> GitHubClient {
     GitHubClient::with_base_url(
         "test-agent",
@@ -352,13 +489,28 @@ async fn mock_graphql_response(
     body_fragment: Option<&str>,
     data: Value,
 ) {
+    mock_graphql_response_with_template(
+        server,
+        operation_name,
+        body_fragment,
+        ResponseTemplate::new(200).set_body_json(json!({ "data": data })),
+    )
+    .await;
+}
+
+async fn mock_graphql_response_with_template(
+    server: &MockServer,
+    operation_name: &str,
+    body_fragment: Option<&str>,
+    template: ResponseTemplate,
+) {
     let body_fragment = body_fragment.unwrap_or_default().to_owned();
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains(operation_name))
         .and(body_string_contains(body_fragment))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": data })))
+        .respond_with(template)
         .expect(1)
         .mount(server)
         .await;

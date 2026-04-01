@@ -11,6 +11,7 @@ use reqwest::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::task::JoinSet;
 
 use super::models::{
     AccountLookupData, GraphQlCommitConnection, GraphQlError, GraphQlPullRequestCommitNode,
@@ -36,7 +37,7 @@ query AccountLookup($username: String!) {
 
 const SEARCH_AUTHORED_PULL_REQUESTS_QUERY: &str = r#"
 query SearchAuthoredPullRequests($query: String!, $cursor: String) {
-  search(query: $query, type: ISSUE, first: 25, after: $cursor) {
+  search(query: $query, type: ISSUE, first: 50, after: $cursor) {
     pageInfo {
       hasNextPage
       endCursor
@@ -46,7 +47,6 @@ query SearchAuthoredPullRequests($query: String!, $cursor: String) {
       ... on PullRequest {
         id
         number
-        createdAt
         repository {
           name
           isPrivate
@@ -135,7 +135,10 @@ query PullRequestCommitsPage($pullRequestId: ID!, $cursor: String) {
 }
 "#;
 
-const PULL_REQUEST_DETAILS_BATCH_SIZE: usize = 10;
+const PULL_REQUEST_DETAILS_BATCH_SIZE: usize = 20;
+
+/// Default cap for concurrent pull-request detail batch hydration requests.
+pub const DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY: usize = 4;
 
 /// Lightweight discovery record collected from the authored-PR search query.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +156,7 @@ pub struct GitHubClient {
     user_agent: String,
     graphql_url: Url,
     token: String,
+    pull_request_details_concurrency: usize,
 }
 
 impl fmt::Debug for GitHubClient {
@@ -162,6 +166,10 @@ impl fmt::Debug for GitHubClient {
             .field("inner", &self.inner)
             .field("user_agent", &self.user_agent)
             .field("graphql_url", &self.graphql_url)
+            .field(
+                "pull_request_details_concurrency",
+                &self.pull_request_details_concurrency,
+            )
             .field("token", &"<redacted>")
             .finish()
     }
@@ -215,6 +223,7 @@ impl GitHubClient {
             user_agent,
             graphql_url,
             token,
+            pull_request_details_concurrency: DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY,
         })
     }
 
@@ -226,6 +235,24 @@ impl GitHubClient {
     /// Returns the User-Agent string configured for outgoing requests.
     pub fn user_agent(&self) -> &str {
         &self.user_agent
+    }
+
+    /// Returns the configured maximum number of concurrent detail hydration requests.
+    pub fn pull_request_details_concurrency(&self) -> usize {
+        self.pull_request_details_concurrency
+    }
+
+    /// Overrides the maximum number of concurrent detail hydration requests.
+    pub fn with_pull_request_details_concurrency(
+        mut self,
+        pull_request_details_concurrency: usize,
+    ) -> Result<Self> {
+        if pull_request_details_concurrency == 0 {
+            bail!("pull request details concurrency must be at least 1")
+        }
+
+        self.pull_request_details_concurrency = pull_request_details_concurrency;
+        Ok(self)
     }
 
     /// Verifies that the requested GitHub account exists and is a user, not an organization.
@@ -268,16 +295,91 @@ impl GitHubClient {
         let pull_request_refs = self
             .search_authored_pull_request_refs(username, &search_query)
             .await?;
+
+        self.fetch_pull_request_details_batches(&pull_request_refs)
+            .await
+    }
+
+    /// Hydrates discovered pull-request batches concurrently while preserving batch order.
+    async fn fetch_pull_request_details_batches(
+        &self,
+        pull_request_refs: &[DiscoveredPullRequestRef],
+    ) -> Result<Vec<NormalizedPullRequest>> {
+        let detail_batches = pull_request_refs
+            .chunks(PULL_REQUEST_DETAILS_BATCH_SIZE)
+            .map(|batch| batch.to_vec())
+            .collect::<Vec<_>>();
+
+        if detail_batches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut join_set = JoinSet::new();
+        let mut next_batch_index = 0;
+        let mut completed_batches = Vec::with_capacity(detail_batches.len());
+
+        while next_batch_index < detail_batches.len()
+            && join_set.len() < self.pull_request_details_concurrency
+        {
+            self.spawn_pull_request_details_batch(
+                &mut join_set,
+                next_batch_index,
+                detail_batches[next_batch_index].clone(),
+            );
+            next_batch_index += 1;
+        }
+
+        while let Some(join_result) = join_set.join_next().await {
+            let (batch_index, batch_pull_requests) = match join_result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    join_set.abort_all();
+                    return Err(error);
+                }
+                Err(error) => {
+                    join_set.abort_all();
+                    return Err(error).context("pull request detail hydration task failed to join");
+                }
+            };
+            completed_batches.push((batch_index, batch_pull_requests));
+
+            if next_batch_index < detail_batches.len() {
+                self.spawn_pull_request_details_batch(
+                    &mut join_set,
+                    next_batch_index,
+                    detail_batches[next_batch_index].clone(),
+                );
+                next_batch_index += 1;
+            }
+        }
+
+        completed_batches.sort_by_key(|(batch_index, _)| *batch_index);
+
         let mut pull_requests = Vec::with_capacity(pull_request_refs.len());
 
-        for pull_request_batch in pull_request_refs.chunks(PULL_REQUEST_DETAILS_BATCH_SIZE) {
-            pull_requests.extend(
-                self.fetch_pull_request_details_batch(pull_request_batch)
-                    .await?,
-            );
+        for (_, batch_pull_requests) in completed_batches {
+            pull_requests.extend(batch_pull_requests);
         }
 
         Ok(pull_requests)
+    }
+
+    /// Spawns one detail-hydration task for a discovered pull-request batch.
+    fn spawn_pull_request_details_batch(
+        &self,
+        join_set: &mut JoinSet<Result<(usize, Vec<NormalizedPullRequest>)>>,
+        batch_index: usize,
+        pull_request_refs: Vec<DiscoveredPullRequestRef>,
+    ) {
+        let client = self.clone();
+
+        join_set.spawn(async move {
+            let pull_requests = client
+                .fetch_pull_request_details_batch(&pull_request_refs)
+                .await?;
+
+            Ok((batch_index, pull_requests))
+        });
     }
 
     /// Runs the lightweight authored-PR search query and collects discovered PR ids.
@@ -344,10 +446,6 @@ impl GitHubClient {
         let number = required(
             node.number,
             format!("pull request node {node_id} is missing number"),
-        )?;
-        let _created_at = required(
-            node.created_at,
-            format!("pull request node {node_id} is missing createdAt"),
         )?;
 
         Ok(Some(DiscoveredPullRequestRef {

@@ -83,7 +83,6 @@ pub(crate) struct SearchPullRequestRefNode {
     pub typename: String,
     pub id: Option<String>,
     pub number: Option<i64>,
-    pub created_at: Option<String>,
     pub repository: Option<GraphQlRepository>,
 }
 

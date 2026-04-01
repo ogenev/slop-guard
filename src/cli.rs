@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -7,7 +10,7 @@ use serde::Serialize;
 use crate::analyzers::analyze_pull_requests;
 use crate::domain::RiskScore;
 use crate::features::aggregate;
-use crate::github::GitHubClient;
+use crate::github::{DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY, GitHubClient};
 use crate::ingest::{IngestService, SyncSummary};
 use crate::scoring::ScoreEngine;
 use crate::store::Store;
@@ -35,6 +38,14 @@ enum Command {
         username: String,
         #[arg(long, default_value_t = 30)]
         days: u16,
+        #[arg(
+            long,
+            default_value_t = NonZeroUsize::new(DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY)
+                .expect("default details concurrency should be non-zero"),
+            value_name = "N",
+            help = "Maximum number of concurrent pull-request detail batches to hydrate"
+        )]
+        details_concurrency: NonZeroUsize,
     },
     Score {
         username: String,
@@ -45,6 +56,14 @@ enum Command {
         username: String,
         #[arg(long, default_value_t = 30)]
         days: u16,
+        #[arg(
+            long,
+            default_value_t = NonZeroUsize::new(DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY)
+                .expect("default details concurrency should be non-zero"),
+            value_name = "N",
+            help = "Maximum number of concurrent pull-request detail batches to hydrate"
+        )]
+        details_concurrency: NonZeroUsize,
     },
     ShowLayout,
 }
@@ -61,9 +80,14 @@ pub async fn run() -> Result<()> {
     let Cli { db_path, command } = Cli::parse();
 
     match command {
-        Command::Sync { username, days } => {
+        Command::Sync {
+            username,
+            days,
+            details_concurrency,
+        } => {
             let database_path = resolve_database_path(db_path.clone())?;
-            let summary = sync_account(&database_path, &username, days).await?;
+            let summary =
+                sync_account(&database_path, &username, days, details_concurrency.get()).await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Command::Score { username, days } => {
@@ -71,9 +95,14 @@ pub async fn run() -> Result<()> {
             let score = score_account(&database_path, &username, days).await?;
             println!("{}", serde_json::to_string_pretty(&score)?);
         }
-        Command::Analyze { username, days } => {
+        Command::Analyze {
+            username,
+            days,
+            details_concurrency,
+        } => {
             let database_path = resolve_database_path(db_path)?;
-            let sync = sync_account(&database_path, &username, days).await?;
+            let sync =
+                sync_account(&database_path, &username, days, details_concurrency.get()).await?;
             let score = score_account(&database_path, &username, days).await?;
             let output = AnalyzeAccountOutput { sync, score };
             println!("{}", serde_json::to_string_pretty(&output)?);
@@ -98,9 +127,15 @@ fn resolve_database_path(configured_path: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// Runs the real GitHub ingestion flow and returns the sync summary.
-async fn sync_account(database_path: &Path, username: &str, days: u16) -> Result<SyncSummary> {
+async fn sync_account(
+    database_path: &Path,
+    username: &str,
+    days: u16,
+    details_concurrency: usize,
+) -> Result<SyncSummary> {
     let store = Store::connect(database_path).await?;
-    let client = GitHubClient::from_env()?;
+    let client =
+        GitHubClient::from_env()?.with_pull_request_details_concurrency(details_concurrency)?;
     let service = IngestService::new(client, store);
     service.sync_account(username, days).await
 }
@@ -146,6 +181,8 @@ mod tests {
 
     use clap::Parser;
 
+    use crate::github::DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY;
+
     use super::{Cli, Command, resolve_database_path};
 
     #[test]
@@ -162,9 +199,17 @@ mod tests {
         let cli = Cli::try_parse_from(["slop", "sync", "ogi", "--days", "30"])
             .expect("sync command should parse");
         match cli.command {
-            Command::Sync { username, days } => {
+            Command::Sync {
+                username,
+                days,
+                details_concurrency,
+            } => {
                 assert_eq!(username, "ogi");
                 assert_eq!(days, 30);
+                assert_eq!(
+                    details_concurrency.get(),
+                    DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY
+                );
             }
             other => panic!("expected sync command, got {other:?}"),
         }
@@ -179,14 +224,35 @@ mod tests {
             other => panic!("expected score command, got {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["slop", "analyze", "ogi", "--days", "60"])
-            .expect("analyze command should parse");
+        let cli = Cli::try_parse_from([
+            "slop",
+            "analyze",
+            "ogi",
+            "--days",
+            "60",
+            "--details-concurrency",
+            "8",
+        ])
+        .expect("analyze command should parse");
         match cli.command {
-            Command::Analyze { username, days } => {
+            Command::Analyze {
+                username,
+                days,
+                details_concurrency,
+            } => {
                 assert_eq!(username, "ogi");
                 assert_eq!(days, 60);
+                assert_eq!(details_concurrency.get(), 8);
             }
             other => panic!("expected analyze command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_zero_details_concurrency() {
+        let error = Cli::try_parse_from(["slop", "sync", "ogi", "--details-concurrency", "0"])
+            .expect_err("zero details concurrency should be rejected");
+
+        assert!(error.to_string().contains("zero"));
     }
 }
