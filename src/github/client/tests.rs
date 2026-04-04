@@ -7,7 +7,10 @@ use wiremock::{
     matchers::{body_string_contains, method, path},
 };
 
-use crate::github::queries::SEARCH_AUTHORED_PULL_REQUESTS_QUERY;
+use crate::github::queries::{
+    PULL_REQUEST_COMMITS_PAGE_QUERY, PULL_REQUEST_DETAILS_QUERY,
+    SEARCH_AUTHORED_PULL_REQUESTS_QUERY,
+};
 
 use super::{DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY, GitHubClient};
 
@@ -15,6 +18,13 @@ use super::{DEFAULT_PULL_REQUEST_DETAILS_CONCURRENCY, GitHubClient};
 fn authored_pull_request_search_uses_larger_page_size() {
     assert!(SEARCH_AUTHORED_PULL_REQUESTS_QUERY.contains("first: 50"));
     assert!(!SEARCH_AUTHORED_PULL_REQUESTS_QUERY.contains("createdAt"));
+}
+
+#[test]
+fn detail_queries_omit_redundant_repository_metadata() {
+    assert!(!PULL_REQUEST_DETAILS_QUERY.contains("\n      number\n"));
+    assert!(!PULL_REQUEST_DETAILS_QUERY.contains("repository {"));
+    assert!(!PULL_REQUEST_COMMITS_PAGE_QUERY.contains("repository {"));
 }
 
 #[test]
@@ -118,7 +128,6 @@ async fn fetches_authored_pull_requests_with_commit_hydration() {
                         "__typename": "PullRequest",
                         "id": "PR_kwDOAAABc842",
                         "number": 42,
-                        "createdAt": "2026-03-01T10:00:00Z",
                         "repository": {
                             "name": "cargo",
                             "isPrivate": false,
@@ -140,7 +149,6 @@ async fn fetches_authored_pull_requests_with_commit_hydration() {
                     "__typename": "PullRequest",
                     "id": "PR_kwDOAAABc842",
                     "databaseId": 12345,
-                    "number": 42,
                     "title": "Improve parser coverage",
                     "body": "Adds regression tests and cleanup.",
                     "state": "OPEN",
@@ -151,11 +159,6 @@ async fn fetches_authored_pull_requests_with_commit_hydration() {
                     "changedFiles": 3,
                     "baseRefName": "main",
                     "headRefName": "topic/coverage",
-                    "repository": {
-                        "name": "cargo",
-                        "isPrivate": false,
-                        "owner": { "username": "rust-lang" }
-                    },
                     "commits": {
                         "pageInfo": {
                             "hasNextPage": false,
@@ -224,7 +227,6 @@ async fn fetches_additional_commit_pages_for_pull_requests() {
                         "__typename": "PullRequest",
                         "id": "PR_kwDOAAABc843",
                         "number": 99,
-                        "createdAt": "2026-03-05T10:00:00Z",
                         "repository": {
                             "name": "cargo",
                             "isPrivate": false,
@@ -246,7 +248,6 @@ async fn fetches_additional_commit_pages_for_pull_requests() {
                     "__typename": "PullRequest",
                     "id": "PR_kwDOAAABc843",
                     "databaseId": 67890,
-                    "number": 99,
                     "title": "Handle pagination",
                     "body": null,
                     "state": "MERGED",
@@ -257,11 +258,6 @@ async fn fetches_additional_commit_pages_for_pull_requests() {
                     "changedFiles": 2,
                     "baseRefName": "main",
                     "headRefName": "topic/pagination",
-                    "repository": {
-                        "name": "cargo",
-                        "isPrivate": false,
-                        "owner": { "username": "rust-lang" }
-                    },
                     "commits": {
                         "pageInfo": {
                             "hasNextPage": true,
@@ -290,11 +286,6 @@ async fn fetches_additional_commit_pages_for_pull_requests() {
         json!({
             "node": {
                 "__typename": "PullRequest",
-                "repository": {
-                    "name": "cargo",
-                    "isPrivate": false,
-                    "owner": { "username": "rust-lang" }
-                },
                 "commits": {
                     "pageInfo": {
                         "hasNextPage": false,
@@ -408,7 +399,6 @@ async fn skips_private_pull_requests_from_search_results() {
                         "__typename": "PullRequest",
                         "id": "PR_kwDOAAABc844",
                         "number": 7,
-                        "createdAt": "2026-03-01T10:00:00Z",
                         "repository": {
                             "name": "secret-repo",
                             "isPrivate": true,
@@ -434,7 +424,6 @@ fn discovered_pull_request_node(index: usize) -> Value {
         "__typename": "PullRequest",
         "id": format!("PR_batch_{index:02}"),
         "number": index as i64 + 1,
-        "createdAt": format!("2026-03-{:02}T10:00:00Z", (index % 28) + 1),
         "repository": {
             "name": "cargo",
             "isPrivate": false,
@@ -448,7 +437,6 @@ fn hydrated_pull_request_node(index: usize) -> Value {
         "__typename": "PullRequest",
         "id": format!("PR_batch_{index:02}"),
         "databaseId": 1000 + index as i64,
-        "number": index as i64 + 1,
         "title": format!("Batch pull request {index}"),
         "body": null,
         "state": "OPEN",
@@ -459,11 +447,6 @@ fn hydrated_pull_request_node(index: usize) -> Value {
         "changedFiles": 1,
         "baseRefName": "main",
         "headRefName": format!("topic/batch-{index}"),
-        "repository": {
-            "name": "cargo",
-            "isPrivate": false,
-            "owner": { "username": "rust-lang" }
-        },
         "commits": {
             "pageInfo": {
                 "hasNextPage": false,

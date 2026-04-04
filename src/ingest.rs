@@ -223,7 +223,6 @@ mod tests {
                             "__typename": "PullRequest",
                             "id": "PR_kwDOAAABc842",
                             "number": 42,
-                            "createdAt": "2026-03-01T10:00:00Z",
                             "repository": {
                                 "name": "cargo",
                                 "isPrivate": false,
@@ -245,7 +244,6 @@ mod tests {
                         "__typename": "PullRequest",
                         "id": "PR_kwDOAAABc842",
                         "databaseId": 9001,
-                        "number": 42,
                         "title": "Improve parser coverage",
                         "body": "Adds regression tests and cleanup.",
                         "state": "OPEN",
@@ -256,11 +254,6 @@ mod tests {
                         "changedFiles": 3,
                         "baseRefName": "main",
                         "headRefName": "topic/coverage",
-                        "repository": {
-                            "name": "cargo",
-                            "isPrivate": false,
-                            "owner": { "username": "rust-lang" }
-                        },
                         "commits": {
                             "pageInfo": {
                                 "hasNextPage": false,

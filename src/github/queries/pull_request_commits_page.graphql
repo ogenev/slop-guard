@@ -2,13 +2,6 @@ query PullRequestCommitsPage($pullRequestId: ID!, $cursor: String) {
   node(id: $pullRequestId) {
     __typename
     ... on PullRequest {
-      repository {
-        name
-        isPrivate
-        owner {
-          username: login
-        }
-      }
       commits(first: 100, after: $cursor) {
         pageInfo {
           hasNextPage

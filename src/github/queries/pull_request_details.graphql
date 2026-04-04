@@ -4,7 +4,6 @@ query PullRequestDetailsBatch($ids: [ID!]!) {
     ... on PullRequest {
       id
       databaseId
-      number
       title
       body
       state
@@ -15,13 +14,6 @@ query PullRequestDetailsBatch($ids: [ID!]!) {
       changedFiles
       baseRefName
       headRefName
-      repository {
-        name
-        isPrivate
-        owner {
-          username: login
-        }
-      }
       commits(first: 100) {
         pageInfo {
           hasNextPage

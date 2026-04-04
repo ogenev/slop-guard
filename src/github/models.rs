@@ -100,7 +100,6 @@ pub(crate) struct PullRequestDetailsNode {
     pub typename: String,
     pub id: Option<String>,
     pub database_id: Option<i64>,
-    pub number: Option<i64>,
     pub title: Option<String>,
     pub body: Option<String>,
     pub state: Option<String>,
@@ -111,7 +110,6 @@ pub(crate) struct PullRequestDetailsNode {
     pub changed_files: Option<i64>,
     pub base_ref_name: Option<String>,
     pub head_ref_name: Option<String>,
-    pub repository: Option<GraphQlRepository>,
     pub commits: Option<GraphQlCommitConnection>,
 }
 
@@ -160,6 +158,5 @@ pub(crate) struct PullRequestCommitsPageData {
 pub(crate) struct PullRequestNode {
     #[serde(rename = "__typename")]
     pub typename: String,
-    pub repository: Option<GraphQlRepository>,
     pub commits: Option<GraphQlCommitConnection>,
 }

@@ -16,9 +16,9 @@ use tokio::task::JoinSet;
 use super::{
     models::{
         AccountLookupData, GraphQlCommitConnection, GraphQlError, GraphQlPullRequestCommitNode,
-        GraphQlRepository, GraphQlResponse, NormalizedCommit, NormalizedPullRequest,
-        PullRequestCommitsPageData, PullRequestDetailsData, PullRequestDetailsNode,
-        SearchPullRequestRefNode, SearchPullRequestsData,
+        GraphQlResponse, NormalizedCommit, NormalizedPullRequest, PullRequestCommitsPageData,
+        PullRequestDetailsData, PullRequestDetailsNode, SearchPullRequestRefNode,
+        SearchPullRequestsData,
     },
     queries::{
         ACCOUNT_LOOKUP_QUERY, PULL_REQUEST_COMMITS_PAGE_QUERY, PULL_REQUEST_DETAILS_QUERY,
@@ -392,9 +392,10 @@ impl GitHubClient {
                 pull_request_ref.node_id,
             ))?;
 
-            if let Some(pull_request) = self.normalize_pull_request_details_node(node).await? {
-                pull_requests.push(pull_request);
-            }
+            let pull_request = self
+                .normalize_pull_request_details_node(node, pull_request_ref)
+                .await?;
+            pull_requests.push(pull_request);
         }
 
         Ok(pull_requests)
@@ -404,7 +405,8 @@ impl GitHubClient {
     async fn normalize_pull_request_details_node(
         &self,
         node: PullRequestDetailsNode,
-    ) -> Result<Option<NormalizedPullRequest>> {
+        pull_request_ref: &DiscoveredPullRequestRef,
+    ) -> Result<NormalizedPullRequest> {
         if node.typename != "PullRequest" {
             bail!(
                 "GitHub GraphQL details batch returned non-pull-request node type {}",
@@ -413,25 +415,9 @@ impl GitHubClient {
         }
 
         let node_id = required(node.id, "pull request details node is missing node id")?;
-        let repository = required(
-            node.repository,
-            format!("pull request node {node_id} is missing repository metadata"),
-        )?;
-
-        if repository.is_private {
-            return Ok(None);
-        }
-
-        let GraphQlRepository {
-            name: repository_name,
-            is_private: _,
-            owner,
-        } = repository;
-        let repository_owner = owner.username;
-        let number = required(
-            node.number,
-            format!("pull request node {node_id} is missing number"),
-        )?;
+        let repository_owner = pull_request_ref.repository_owner.clone();
+        let repository_name = pull_request_ref.repository_name.clone();
+        let number = pull_request_ref.number;
         let title = required(
             node.title,
             format!("pull request node {node_id} is missing title"),
@@ -492,7 +478,7 @@ impl GitHubClient {
             page_info = next_page.page_info;
         }
 
-        Ok(Some(NormalizedPullRequest {
+        Ok(NormalizedPullRequest {
             external_id,
             repository_owner,
             repository_name,
@@ -508,7 +494,7 @@ impl GitHubClient {
             base_branch: node.base_ref_name,
             head_branch: node.head_ref_name,
             commits,
-        }))
+        })
     }
 
     /// Fetches an additional page of commits for a previously discovered pull request.
@@ -540,14 +526,6 @@ impl GitHubClient {
             bail!(
                 "GitHub GraphQL node {} is not a pull request",
                 pull_request_node_id
-            )
-        }
-
-        if let Some(repository) = node.repository.as_ref()
-            && repository.is_private
-        {
-            bail!(
-                "pull request {repository_owner}/{repository_name}#{pull_request_number} is private and outside current scope"
             )
         }
 
